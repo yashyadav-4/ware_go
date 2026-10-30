@@ -1,0 +1,10 @@
+*.exe
+/bin/
+
+.env
+
+*.out
+.*test
+
+*.pdf
+*.txt
