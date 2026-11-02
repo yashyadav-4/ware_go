@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/yashyadav-4/ware_go/internal/config"
 	"github.com/yashyadav-4/ware_go/internal/repository/db"
+	"github.com/yashyadav-4/ware_go/internal/api"
 )
 
 func main(){
@@ -52,7 +53,6 @@ func main(){
 	slog.Info("connected to postgresql successfully")
 
 	queries := db.New(pool)
-	_ = queries
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -71,6 +71,7 @@ func main(){
 		w.Write([]byte(`{"status":"ok"}`))
 	})
 
+	api.RegisterRoutes(r, queries)
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", cfg.Port),
