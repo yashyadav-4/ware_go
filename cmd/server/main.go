@@ -17,6 +17,7 @@ import (
 	"github.com/yashyadav-4/ware_go/internal/config"
 	"github.com/yashyadav-4/ware_go/internal/repository/db"
 	"github.com/yashyadav-4/ware_go/internal/api"
+	"github.com/redis/go-redis/v9"
 )
 
 func main(){
@@ -52,6 +53,19 @@ func main(){
 	}
 	slog.Info("connected to postgresql successfully")
 
+	slog.Info("Connecting to redis....")
+	rdb := redis.NewClient(&redis.Options{
+		Addr: cfg.RedisAddr,
+	})
+	defer rdb.Close()
+
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		slog.Error("failed to ping redis", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("connected to redis successfully")
+
+
 	queries := db.New(pool)
 
 	r := chi.NewRouter()
@@ -66,12 +80,18 @@ func main(){
 			http.Error(w , `{"status":"database unreachable"}`, http.StatusServiceUnavailable)
 			return
 		}
+
+		if err := rdb.Ping(r.Context()).Err(); err != nil {
+			http.Error(w, `{"status":"redis unreachable"}`, http.StatusServiceUnavailable)
+			return
+		}
+
 		w.Header().Set("Content-Type" , "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"ok"}`))
 	})
 
-	api.RegisterRoutes(r, queries)
+	api.RegisterRoutes(r, pool , queries , rdb)
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", cfg.Port),
