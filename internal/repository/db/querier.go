@@ -11,16 +11,27 @@ import (
 )
 
 type Querier interface {
+	CompleteIdempotencyKey(ctx context.Context, arg CompleteIdempotencyKeyParams) (IdempotencyKey, error)
+	CreateIdempotencyKey(ctx context.Context, arg CreateIdempotencyKeyParams) (IdempotencyKey, error)
+	CreateOrder(ctx context.Context, arg CreateOrderParams) (Order, error)
+	CreateOrderItem(ctx context.Context, arg CreateOrderItemParams) (OrderItem, error)
 	CreateProduct(ctx context.Context, arg CreateProductParams) (Product, error)
 	CreateWarehouse(ctx context.Context, arg CreateWarehouseParams) (Warehouse, error)
+	GetIdempotencyKey(ctx context.Context, key string) (IdempotencyKey, error)
 	GetInventoryByWarehouseAndSKU(ctx context.Context, arg GetInventoryByWarehouseAndSKUParams) (InventoryItem, error)
+	GetInventoryForUpdate(ctx context.Context, arg GetInventoryForUpdateParams) (InventoryItem, error)
+	GetOrder(ctx context.Context, id pgtype.UUID) (Order, error)
 	GetProductBySKU(ctx context.Context, sku string) (Product, error)
 	GetWarehouseByCode(ctx context.Context, code string) (Warehouse, error)
 	GetWarehouseByID(ctx context.Context, id pgtype.UUID) (Warehouse, error)
 	InsertAuditlog(ctx context.Context, arg InsertAuditlogParams) (InventoryAuditLog, error)
 	ListActiveWarehouses(ctx context.Context) ([]Warehouse, error)
+	ListAvailableWarehousesForSku(ctx context.Context, sku string) ([]ListAvailableWarehousesForSkuRow, error)
 	ListInventoryBySKU(ctx context.Context, sku string) ([]ListInventoryBySKURow, error)
+	ListOrderItems(ctx context.Context, orderID pgtype.UUID) ([]OrderItem, error)
 	ListProducts(ctx context.Context) ([]Product, error)
+	ReserveInventoryStock(ctx context.Context, arg ReserveInventoryStockParams) (InventoryItem, error)
+	UpdateOrderStatus(ctx context.Context, arg UpdateOrderStatusParams) (Order, error)
 	UpsertRestockInventory(ctx context.Context, arg UpsertRestockInventoryParams) (InventoryItem, error)
 }
 

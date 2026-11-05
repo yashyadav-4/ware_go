@@ -43,3 +43,18 @@ FROM inventory_items i
 JOIN warehouses w ON i.warehouse_id = w.id
 WHERE i.sku = $1 AND  w.is_active = TRUE
 ORDER BY i.available_qty DESC;
+
+
+-- name: GetInventoryForUpdate :one
+SELECT * FROM inventory_items WHERE warehouse_id = $1 AND sku = $2 FOR UPDATE;
+
+
+-- name: ReserveInventoryStock :one
+UPDATE inventory_items
+SET available_qty = available_qty - $3,
+    reserved_qty = reserved_qty + $3,
+    version = version + 1,
+    updated_at = NOW()
+WHERE warehouse_id = $1 AND sku = $2
+RETURNING *;
+

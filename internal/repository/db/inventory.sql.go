@@ -35,6 +35,30 @@ func (q *Queries) GetInventoryByWarehouseAndSKU(ctx context.Context, arg GetInve
 	return i, err
 }
 
+const getInventoryForUpdate = `-- name: GetInventoryForUpdate :one
+SELECT id, warehouse_id, sku, available_qty, reserved_qty, version, updated_at FROM inventory_items WHERE warehouse_id = $1 AND sku = $2 FOR UPDATE
+`
+
+type GetInventoryForUpdateParams struct {
+	WarehouseID pgtype.UUID `json:"warehouse_id"`
+	Sku         string      `json:"sku"`
+}
+
+func (q *Queries) GetInventoryForUpdate(ctx context.Context, arg GetInventoryForUpdateParams) (InventoryItem, error) {
+	row := q.db.QueryRow(ctx, getInventoryForUpdate, arg.WarehouseID, arg.Sku)
+	var i InventoryItem
+	err := row.Scan(
+		&i.ID,
+		&i.WarehouseID,
+		&i.Sku,
+		&i.AvailableQty,
+		&i.ReservedQty,
+		&i.Version,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const insertAuditlog = `-- name: InsertAuditlog :one
 INSERT INTO inventory_audit_log(
     warehouse_id,
@@ -130,6 +154,37 @@ func (q *Queries) ListInventoryBySKU(ctx context.Context, sku string) ([]ListInv
 		return nil, err
 	}
 	return items, nil
+}
+
+const reserveInventoryStock = `-- name: ReserveInventoryStock :one
+UPDATE inventory_items
+SET available_qty = available_qty - $3,
+    reserved_qty = reserved_qty + $3,
+    version = version + 1,
+    updated_at = NOW()
+WHERE warehouse_id = $1 AND sku = $2
+RETURNING id, warehouse_id, sku, available_qty, reserved_qty, version, updated_at
+`
+
+type ReserveInventoryStockParams struct {
+	WarehouseID  pgtype.UUID `json:"warehouse_id"`
+	Sku          string      `json:"sku"`
+	AvailableQty int32       `json:"available_qty"`
+}
+
+func (q *Queries) ReserveInventoryStock(ctx context.Context, arg ReserveInventoryStockParams) (InventoryItem, error) {
+	row := q.db.QueryRow(ctx, reserveInventoryStock, arg.WarehouseID, arg.Sku, arg.AvailableQty)
+	var i InventoryItem
+	err := row.Scan(
+		&i.ID,
+		&i.WarehouseID,
+		&i.Sku,
+		&i.AvailableQty,
+		&i.ReservedQty,
+		&i.Version,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const upsertRestockInventory = `-- name: UpsertRestockInventory :one
