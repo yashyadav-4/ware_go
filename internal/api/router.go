@@ -4,13 +4,21 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"github.com/yashyadav-4/ware_go/internal/api/middleware"
 	"github.com/yashyadav-4/ware_go/internal/repository/db"
+	"github.com/yashyadav-4/ware_go/internal/service"
 )
 
 func RegisterRoutes(r chi.Router, pool *pgxpool.Pool, queries *db.Queries, rdb *redis.Client) {
 	warehouseHandler := NewWarehouseHandler(queries)
 	productHandler := NewProductHandler(queries)
 	inventoryHandler := NewInventoryHandler(pool , queries, rdb)
+
+	//service layer
+	routingSvc := service.NewRoutingService(queries)
+	reservationSvc := service.NewReservationService(pool, queries , routingSvc , nil) //nil defaults to pessimistic strategy
+
+	OrderHandler := NewOrderHandler(queries , reservationSvc)
 
 	r.Route("/api/v1" , func(r chi.Router){
 		r.Route("/warehouses" , func(r chi.Router){
@@ -27,6 +35,11 @@ func RegisterRoutes(r chi.Router, pool *pgxpool.Pool, queries *db.Queries, rdb *
 		r.Route("/inventory" , func(r chi.Router){
 			r.Post("/restock" , inventoryHandler.Restock)
 			r.Get("/{sku}" , inventoryHandler.GetStockBySKU)
+		})
+
+		r.Route("/orders" , func (r chi.Router){
+			r.With(middleware.Idempotency(queries)).Post("/reserve" , OrderHandler.Reserve) //with idempotency middleware
+			r.Get("/{id}" , OrderHandler.GetOrder)
 		})
 	})
 }
