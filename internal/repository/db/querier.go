@@ -12,6 +12,7 @@ import (
 
 type Querier interface {
 	CompleteIdempotencyKey(ctx context.Context, arg CompleteIdempotencyKeyParams) (IdempotencyKey, error)
+	ConfirmInventoryStock(ctx context.Context, arg ConfirmInventoryStockParams) (InventoryItem, error)
 	CreateIdempotencyKey(ctx context.Context, arg CreateIdempotencyKeyParams) (IdempotencyKey, error)
 	CreateOrder(ctx context.Context, arg CreateOrderParams) (Order, error)
 	CreateOrderItem(ctx context.Context, arg CreateOrderItemParams) (OrderItem, error)
@@ -31,6 +32,9 @@ type Querier interface {
 	ListOrderItems(ctx context.Context, orderID pgtype.UUID) ([]OrderItem, error)
 	ListProducts(ctx context.Context) ([]Product, error)
 	ReserveInventoryStock(ctx context.Context, arg ReserveInventoryStockParams) (InventoryItem, error)
+	ReserveInventoryStockAtomic(ctx context.Context, arg ReserveInventoryStockAtomicParams) (InventoryItem, error)
+	ReserveInventoryStockOptimistic(ctx context.Context, arg ReserveInventoryStockOptimisticParams) (InventoryItem, error)
+	RollbackInventoryStock(ctx context.Context, arg RollbackInventoryStockParams) (InventoryItem, error)
 	UpdateOrderStatus(ctx context.Context, arg UpdateOrderStatusParams) (Order, error)
 	UpsertRestockInventory(ctx context.Context, arg UpsertRestockInventoryParams) (InventoryItem, error)
 }

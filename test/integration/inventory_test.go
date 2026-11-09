@@ -12,7 +12,7 @@ import (
 	"github.com/yashyadav-4/ware_go/internal/repository/db"
 )
 
-func setupTestDB(t *testing.T) (*pgxpool.Pool, *db.Queries) {
+func setupTestDB(t testing.TB) (*pgxpool.Pool, *db.Queries) {
 	t.Helper()
 	cfg := config.Load()
 

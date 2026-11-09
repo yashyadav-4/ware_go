@@ -1,4 +1,4 @@
-# AegisWMS — Multi-Warehouse Inventory & Order Fulfillment Engine
+# Ware_Go — Multi-Warehouse Inventory & Order Fulfillment Engine
 
 > High-concurrency backend in Go and PostgreSQL. Engineered for correctness under contention —
 > zero oversell, deadlock immunity, and sub-25 ms reservation latency at 1,000 RPS.
@@ -12,7 +12,7 @@
 
 ## What It Does
 
-AegisWMS manages stock across multiple warehouses and lets thousands of customers race for the same
+Ware_Go manages stock across multiple warehouses and lets thousands of customers race for the same
 limited inventory simultaneously — **without ever selling a unit that doesn't exist**. It routes
 each order to the optimal warehouse using a cost function over distance and stock ratio, reserves
 inventory inside strict ACID transactions, guarantees every fulfillment event reaches downstream
@@ -24,34 +24,35 @@ systems even if the message broker goes down, and automatically reclaims stock f
 
 ```
                         ┌─────────────────────────────────────────┐
-                        │           Client / HTTP                   │
-                        └───────────────┬─────────────────────────-┘
+                        │           Client / HTTP                 │
+                        └───────────────┬─────────────────────────┘
                                         │
                                         ▼
                         ┌─────────────────────────────────────────────────────────┐
-                        │                  Chi v5 HTTP Router                      │
+                        │                  Chi v5 HTTP Router                     │
                         │  RequestID · Logger · Recoverer · Timeout               │
-                        │  Idempotency Middleware (5 situations)                   │
+                        │  Bounded Admission Semaphore (100 slots, 100 ms queue)  │
+                        │  Idempotency Middleware (5 situations)                  │
                         └──────────────────────┬──────────────────────────────────┘
                                                │
                ┌───────────────────────────────┼───────────────────────────────┐
                │                               │                               │
                ▼                               ▼                               ▼
   ┌────────────────────────┐    ┌──────────────────────────┐    ┌────────────────────┐
-  │     API Handlers        │    │      Service Layer        │    │      /healthz       │
-  │  warehouses · products  │    │  RoutingService           │    │  Postgres + Redis  │
-  │  inventory · orders     │    │  ReservationService       │    │  liveness probe    │
-  │  agent                  │    │  (strategy pattern)       │    └────────────────────┘
-  └───────────┬─────────────┘    └──────────┬───────────────┘
-              │                             │
-              └──────────────┬──────────────┘
+  │     API Handlers       │    │      Service Layer       │    │      /healthz      │
+  │  warehouses · products │    │  RoutingService          │    │  Postgres + Redis  │
+  │  inventory · orders    │    │  ReservationService      │    │  liveness probe    │
+  │  agent                 │    │  (Adaptive Dispatcher)   │    └────────────────────┘
+  └───────────┬────────────┘    └──────────┬───────────────┘
+              │                            │
+              └──────────────┬─────────────┘
                              │
                              ▼
               ┌──────────────────────────────────┐
-              │        Repository Layer           │
-              │   sqlc — type-safe, zero-reflect  │
-              │   pgx/v5 — native Postgres wire   │
-              └────────┬────────────┬─────────────┘
+              │        Repository Layer          │
+              │   sqlc — type-safe, zero-reflect │
+              │   pgx/v5 — native Postgres wire  │
+              └────────┬────────────┬────────────┘
                        │            │
           ┌────────────┘            └──────────────────┐
           │                                            │
@@ -59,7 +60,8 @@ systems even if the message broker goes down, and automatically reclaims stock f
 ┌──────────────────┐                       ┌─────────────────────────────┐
 │  PostgreSQL 16   │                       │        Redis 7              │
 │  pgxpool 5–25    │                       │  Cache-Aside, 5 s TTL       │
-│  connections     │                       │  raw byte passthrough        │
+│  connections     │                       │  raw byte passthrough       │
+│                  │                       │  velocity counter (rate:sku)│
 └──────────────────┘                       └─────────────────────────────┘
           │
           ▼
@@ -256,25 +258,40 @@ This is a proof by construction, not a heuristic. The k6 cross-order scenario me
 
 ---
 
-### 3. Three Locking Strategies — The Right Tool for Each Contention Level
+### 3. Locking Strategies & Dynamic Adaptive Dispatcher
 
-There is no universally optimal locking strategy. All three are implemented behind a
-`ReservationStrategy` interface so they can be swapped and benchmarked:
+There is no universally optimal locking strategy across all traffic profiles. Ware_Go implements
+four distinct strategies behind a unified `ReservationStrategy` interface:
 
 ```go
 type ReservationStrategy interface {
-    Reserve(ctx context.Context, tx pgx.Tx, items []LineItem) error
+    Reserve(ctx context.Context, tx pgx.Tx, items []ReservationItem) error
 }
 ```
 
-| Strategy | Mechanism | Trade-off |
-|---|---|---|
-| **Pessimistic** | `SELECT … FOR UPDATE` | Writers queue behind a mutex; predictable tail latency under high contention — the **default** |
-| **Optimistic (CAS)** | Read `version`, write `WHERE version = $old`, retry on mismatch | No lock held; fast under low contention; retry storms under high contention |
-| **Atomic Conditional** | `UPDATE … SET qty = qty - N WHERE qty >= N` | Single round-trip; no explicit lock; can't span multiple warehouses atomically |
+| Strategy | Mechanism | Best For | Trade-off |
+|---|---|---|---|
+| **Pessimistic** | `SELECT … FOR UPDATE` in strict global hierarchy | Hot SKUs under flash-sale contention | Writers queue deterministically; lock hold time bound to transaction |
+| **Optimistic (CAS)** | CAS on `version` with exponential backoff & jitter | Multi-item carts under low-to-medium contention | Lock-free; backoff & random jitter prevent thundering herds on retry |
+| **Atomic Conditional** | `UPDATE … WHERE available_qty >= N` | Single-SKU flash sales | Zero lock wait; single round-trip; cannot atomically span multiple rows |
+| **Adaptive (Default)** | Dynamically inspects cart shape & Redis SKU velocity | Production mixed workloads | Automatically selects optimal strategy per request |
 
-The benchmark (k6 S6) runs all three strategies under the same load to produce side-by-side p95
-and throughput numbers.
+#### Adaptive Dispatch Logic (`internal/strategy/adaptive.go`)
+
+```
+Incoming Reservation Request
+             │
+             ├── Single Item? ──────▶ Atomic Conditional Update (Fastest, zero lock hold)
+             │
+             └── Multi-Item Cart
+                     │
+                     ▼
+             Check Redis Velocity (`rate:sku:<sku>`)
+                     ├── Velocity ≥ 10 req/s ──▶ Pessimistic (Ordered queues, no retry storms)
+                     └── Velocity < 10 req/s ──▶ Optimistic CAS (Lock-free + exponential jitter)
+```
+
+For reproducible benchmarks and testing, callers can explicitly pin a strategy via the `X-Strategy-Override` header or Go `context.Context`.
 
 ---
 
@@ -397,6 +414,32 @@ than throughput improves. The k6 S4 scenario validates this under production-lik
 
 ---
 
+### 9. Bounded Admission Control & Queue Buffering
+
+Traditional blunt rate limiting (e.g., rejecting every request after 100 req/s) prematurely drops traffic
+during momentary burst spikes, even when DB queries finish in 10–15 ms (allowing 25 pool connections
+to sustain 1,600+ RPS).
+
+Ware_Go implements **Bounded Admission Control** (`internal/api/middleware/semaphore.go`):
+
+```
+Incoming Request
+      │
+      ├── Capacity Available (< 100 active) ──▶ Acquire slot & execute
+      │
+      └── Capacity Full (100 in-flight)
+              │
+              ├── Buffered Wait (≤ 100 ms) ────▶ Slot frees up ──▶ Execute
+              │
+              └── Deadline Exceeded (> 100 ms) ─▶ 429 Too Many Requests (Load shed)
+```
+
+1. **In-Flight Concurrency Limiting (`maxConcurrent = 100`)**: Measures actual saturation rather than arbitrary wall-clock timestamps.
+2. **Buffering Wait Queue (`waitTimeout = 100ms`)**: Natural micro-bursts pause and succeed cleanly without client errors.
+3. **Fail-Fast Load Shedding**: If the database stalls and all 100 slots remain blocked beyond 100 ms, subsequent requests fail immediately with `429 Too Many Requests`, safeguarding connection pools from cascading failure.
+
+---
+
 ## Proven Claims
 
 | # | Claim | Verification |
@@ -449,7 +492,8 @@ Ware_Go/
 ├── internal/
 │   ├── api/
 │   │   ├── middleware/
-│   │   │   └── idempotency.go           # 5-situation idempotency middleware
+│   │   │   ├── idempotency.go           # 5-situation idempotency middleware
+│   │   │   └── semaphore.go             # Bounded admission control (100 in-flight, 100ms queue)
 │   │   ├── inventory.go                 # Restock (ACID txn) + stock read (Cache-Aside)
 │   │   ├── orders.go                    # Reserve / Confirm / Cancel / Get
 │   │   ├── agent.go                     # AI rebalancing proposals
@@ -467,8 +511,9 @@ Ware_Go/
 │   ├── strategy/
 │   │   ├── strategy.go                  # ReservationStrategy interface
 │   │   ├── pessimistic.go               # SELECT … FOR UPDATE
-│   │   ├── optimistic.go                # CAS on version column
-│   │   └── atomic.go                    # UPDATE … WHERE qty >= N
+│   │   ├── optimistic.go                # CAS with exponential backoff & random jitter
+│   │   ├── atomic.go                    # UPDATE … WHERE qty >= N
+│   │   └── adaptive.go                  # Dynamic strategy dispatcher based on cart shape & velocity
 │   │
 │   ├── worker/
 │   │   ├── reaper.go                    # 1-second ticker, SKIP LOCKED, reclaims expired stock
@@ -504,7 +549,9 @@ Ware_Go/
 │
 ├── docker-compose.yml                   # PostgreSQL 16 + Redis 7 + Redpanda
 ├── sqlc.yml
-└── command.md                           # All terminal commands used in development
+├── command.md                           # All terminal commands used in development
+├── questions.md                         # Deep-dive systems & infrastructure Q&A
+└── updated_Ware_Go_project_plan.md      # Master architecture, roadmap & verification specs
 ```
 
 ---

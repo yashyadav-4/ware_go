@@ -58,3 +58,41 @@ SET available_qty = available_qty - $3,
 WHERE warehouse_id = $1 AND sku = $2
 RETURNING *;
 
+
+-- name: ReserveInventoryStockOptimistic :one
+UPDATE inventory_items
+SET available_qty = available_qty - $3,
+    reserved_qty = reserved_qty + $3,
+    version = version + 1,
+    updated_at = NOW()
+WHERE warehouse_id = $1 AND sku = $2 AND version = $4
+RETURNING *;
+
+
+-- name: ReserveInventoryStockAtomic :one
+UPDATE inventory_items
+SET available_qty = available_qty - $3,
+    reserved_qty = reserved_qty + $3,
+    version = version + 1,
+    updated_at = NOW()
+WHERE warehouse_id = $1 AND sku = $2 AND available_qty >= $3
+RETURNING *;
+
+
+-- name: ConfirmInventoryStock :one
+UPDATE inventory_items
+SET reserved_qty = reserved_qty - $3,
+    version = version + 1,
+    updated_at = NOW()
+WHERE warehouse_id = $1 AND sku = $2
+RETURNING *;
+
+
+-- name: RollbackInventoryStock :one
+UPDATE inventory_items
+SET available_qty = available_qty + $3,
+    reserved_qty = reserved_qty - $3,
+    version = version + 1,
+    updated_at = NOW()
+WHERE warehouse_id = $1 AND sku = $2
+RETURNING *;

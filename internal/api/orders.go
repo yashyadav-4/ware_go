@@ -134,3 +134,36 @@ func (h *OrderHandler) GetOrder(w http.ResponseWriter , r *http.Request){
 		Items: items,
 	})
 }
+
+func (h *OrderHandler) ConfirmOrder(w http.ResponseWriter , r *http.Request){
+	idStr := chi.URLParam(r , "id")
+	var orderUUID pgtype.UUID
+
+	if err := orderUUID.Scan(strings.TrimSpace(idStr)); err != nil || !orderUUID.Valid {
+		WriteError(w , http.StatusBadRequest , "invalid order id: must be a valid UUID")
+		return
+	}
+
+	order , err := h.reservationSvc.ConfirmOrder(r.Context() , orderUUID)
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	WriteJSON(w, http.StatusOK, order)
+}
+
+func (h *OrderHandler) CancelOrder(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	var orderUUID pgtype.UUID
+	if err := orderUUID.Scan(strings.TrimSpace(idStr)); err != nil || !orderUUID.Valid {
+		WriteError(w, http.StatusBadRequest, "invalid order id: must be a valid UUID")
+		return
+	}
+	order, err := h.reservationSvc.CancelOrder(r.Context(), orderUUID)
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusOK, order)
+}

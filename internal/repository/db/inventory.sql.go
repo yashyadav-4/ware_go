@@ -11,6 +11,36 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const confirmInventoryStock = `-- name: ConfirmInventoryStock :one
+UPDATE inventory_items
+SET reserved_qty = reserved_qty - $3,
+    version = version + 1,
+    updated_at = NOW()
+WHERE warehouse_id = $1 AND sku = $2
+RETURNING id, warehouse_id, sku, available_qty, reserved_qty, version, updated_at
+`
+
+type ConfirmInventoryStockParams struct {
+	WarehouseID pgtype.UUID `json:"warehouse_id"`
+	Sku         string      `json:"sku"`
+	ReservedQty int32       `json:"reserved_qty"`
+}
+
+func (q *Queries) ConfirmInventoryStock(ctx context.Context, arg ConfirmInventoryStockParams) (InventoryItem, error) {
+	row := q.db.QueryRow(ctx, confirmInventoryStock, arg.WarehouseID, arg.Sku, arg.ReservedQty)
+	var i InventoryItem
+	err := row.Scan(
+		&i.ID,
+		&i.WarehouseID,
+		&i.Sku,
+		&i.AvailableQty,
+		&i.ReservedQty,
+		&i.Version,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getInventoryByWarehouseAndSKU = `-- name: GetInventoryByWarehouseAndSKU :one
 SELECT id, warehouse_id, sku, available_qty, reserved_qty, version, updated_at FROM inventory_items WHERE warehouse_id = $1 AND sku = $2 LIMIT 1
 `
@@ -174,6 +204,105 @@ type ReserveInventoryStockParams struct {
 
 func (q *Queries) ReserveInventoryStock(ctx context.Context, arg ReserveInventoryStockParams) (InventoryItem, error) {
 	row := q.db.QueryRow(ctx, reserveInventoryStock, arg.WarehouseID, arg.Sku, arg.AvailableQty)
+	var i InventoryItem
+	err := row.Scan(
+		&i.ID,
+		&i.WarehouseID,
+		&i.Sku,
+		&i.AvailableQty,
+		&i.ReservedQty,
+		&i.Version,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const reserveInventoryStockAtomic = `-- name: ReserveInventoryStockAtomic :one
+UPDATE inventory_items
+SET available_qty = available_qty - $3,
+    reserved_qty = reserved_qty + $3,
+    version = version + 1,
+    updated_at = NOW()
+WHERE warehouse_id = $1 AND sku = $2 AND available_qty >= $3
+RETURNING id, warehouse_id, sku, available_qty, reserved_qty, version, updated_at
+`
+
+type ReserveInventoryStockAtomicParams struct {
+	WarehouseID  pgtype.UUID `json:"warehouse_id"`
+	Sku          string      `json:"sku"`
+	AvailableQty int32       `json:"available_qty"`
+}
+
+func (q *Queries) ReserveInventoryStockAtomic(ctx context.Context, arg ReserveInventoryStockAtomicParams) (InventoryItem, error) {
+	row := q.db.QueryRow(ctx, reserveInventoryStockAtomic, arg.WarehouseID, arg.Sku, arg.AvailableQty)
+	var i InventoryItem
+	err := row.Scan(
+		&i.ID,
+		&i.WarehouseID,
+		&i.Sku,
+		&i.AvailableQty,
+		&i.ReservedQty,
+		&i.Version,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const reserveInventoryStockOptimistic = `-- name: ReserveInventoryStockOptimistic :one
+UPDATE inventory_items
+SET available_qty = available_qty - $3,
+    reserved_qty = reserved_qty + $3,
+    version = version + 1,
+    updated_at = NOW()
+WHERE warehouse_id = $1 AND sku = $2 AND version = $4
+RETURNING id, warehouse_id, sku, available_qty, reserved_qty, version, updated_at
+`
+
+type ReserveInventoryStockOptimisticParams struct {
+	WarehouseID  pgtype.UUID `json:"warehouse_id"`
+	Sku          string      `json:"sku"`
+	AvailableQty int32       `json:"available_qty"`
+	Version      int64       `json:"version"`
+}
+
+func (q *Queries) ReserveInventoryStockOptimistic(ctx context.Context, arg ReserveInventoryStockOptimisticParams) (InventoryItem, error) {
+	row := q.db.QueryRow(ctx, reserveInventoryStockOptimistic,
+		arg.WarehouseID,
+		arg.Sku,
+		arg.AvailableQty,
+		arg.Version,
+	)
+	var i InventoryItem
+	err := row.Scan(
+		&i.ID,
+		&i.WarehouseID,
+		&i.Sku,
+		&i.AvailableQty,
+		&i.ReservedQty,
+		&i.Version,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const rollbackInventoryStock = `-- name: RollbackInventoryStock :one
+UPDATE inventory_items
+SET available_qty = available_qty + $3,
+    reserved_qty = reserved_qty - $3,
+    version = version + 1,
+    updated_at = NOW()
+WHERE warehouse_id = $1 AND sku = $2
+RETURNING id, warehouse_id, sku, available_qty, reserved_qty, version, updated_at
+`
+
+type RollbackInventoryStockParams struct {
+	WarehouseID  pgtype.UUID `json:"warehouse_id"`
+	Sku          string      `json:"sku"`
+	AvailableQty int32       `json:"available_qty"`
+}
+
+func (q *Queries) RollbackInventoryStock(ctx context.Context, arg RollbackInventoryStockParams) (InventoryItem, error) {
+	row := q.db.QueryRow(ctx, rollbackInventoryStock, arg.WarehouseID, arg.Sku, arg.AvailableQty)
 	var i InventoryItem
 	err := row.Scan(
 		&i.ID,

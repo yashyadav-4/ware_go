@@ -139,3 +139,147 @@ func (s *ReservationService) ReserveOrder(ctx context.Context , req ReserveOrder
 		Strategy:    s.strategy.Name(),
 	}, nil
 }
+
+func (s *ReservationService) ConfirmOrder(ctx context.Context , orderID pgtype.UUID)(*db.Order, error){
+	tx ,err:= s.pool.Begin(ctx);
+	if err != nil {
+		return nil , fmt.Errorf("failed to begin transaction : %w" , err)
+	}
+	defer tx.Rollback(ctx)
+
+	qtx := s.queries.WithTx(tx)
+
+	order , err := qtx.GetOrder(ctx , orderID)
+	if err != nil{
+		return nil , fmt.Errorf("order not found : %w" , err)
+	}
+
+	if order.Status != db.OrderStatusRESERVED {
+		return nil, fmt.Errorf("cannot confirm order in status %s (must be RESERVED)", order.Status)
+	}
+
+	items, err := qtx.ListOrderItems(ctx , orderID)
+	if err != nil {
+		return nil , fmt.Errorf("failed to list order items: %w" ,err)
+	}
+
+	sort.Slice(items , func(i , j int) bool {
+		cmp := bytes.Compare(items[i].WarehouseID.Bytes[:] , items[j].WarehouseID.Bytes[:])
+		if cmp != 0 {
+			return cmp < 0
+		}
+		return items[i].Sku < items[j].Sku
+	})
+
+	for _ , item := range items{
+		_ , err := qtx.ConfirmInventoryStock(ctx , db.ConfirmInventoryStockParams{
+			WarehouseID: item.WarehouseID,
+			Sku:         item.Sku,
+			ReservedQty: item.Quantity,
+		})
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to confirm inventory stock (sku=%s): %w", item.Sku, err)
+		}
+
+		_ , err = qtx.InsertAuditlog(ctx , db.InsertAuditlogParams{
+			WarehouseID:    item.WarehouseID,
+			Sku:            item.Sku,
+			OrderID:        order.ID,
+			EventType:      "COMMIT",
+			DeltaAvailable: 0,
+			DeltaReserved:  -item.Quantity,
+		})
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to write audit log: %w", err)
+		}
+	}
+
+	updatedOrder , err := qtx.UpdateOrderStatus(ctx , db.UpdateOrderStatusParams{
+		ID: order.ID,
+		Status: db.OrderStatusCONFIRMED,
+	})
+
+	if err != nil {
+		return nil , fmt.Errorf("failed to update order status: %w" , err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil , fmt.Errorf("failed to commit order confirmation: %w" , err)
+	}
+
+	return &updatedOrder , nil
+}
+
+func (s *ReservationService)CancelOrder(ctx context.Context, orderID pgtype.UUID) (*db.Order, error){
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	qtx := s.queries.WithTx(tx)
+
+	order, err := qtx.GetOrder(ctx, orderID)
+	if err != nil {
+		return nil, fmt.Errorf("order not found: %w", err)
+	}
+
+	if order.Status != db.OrderStatusRESERVED {
+		return nil, fmt.Errorf("cannot cancel order in status %s (must be RESERVED)", order.Status)
+	}
+
+	items, err := qtx.ListOrderItems(ctx, orderID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list order items: %w", err)
+	}
+	
+	sort.Slice(items, func(i, j int) bool{
+		cmp := bytes.Compare(items[i].WarehouseID.Bytes[:], items[j].WarehouseID.Bytes[:])
+		if cmp != 0 {
+			return cmp < 0
+		}
+		return items[i].Sku < items[j].Sku
+	})
+
+	for _, item := range items {
+		_, err := qtx.RollbackInventoryStock(ctx, db.RollbackInventoryStockParams{
+			WarehouseID:  item.WarehouseID,
+			Sku:          item.Sku,
+			AvailableQty: item.Quantity,
+		})
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to rollback inventory stock (sku=%s): %w", item.Sku, err)
+		}
+
+		_, err = qtx.InsertAuditlog(ctx, db.InsertAuditlogParams{
+			WarehouseID:    item.WarehouseID,
+			Sku:            item.Sku,
+			OrderID:        order.ID,
+			EventType:      "ROLLBACK",
+			DeltaAvailable: item.Quantity,
+			DeltaReserved:  -item.Quantity,
+		})
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to write audit log: %w", err)
+		}
+	}
+
+	updatedOrder, err := qtx.UpdateOrderStatus(ctx, db.UpdateOrderStatusParams{
+		ID:     order.ID,
+		Status: db.OrderStatusCANCELLED,
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to update order status: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit order cancellation: %w", err)
+	}
+	
+	return &updatedOrder, nil
+}

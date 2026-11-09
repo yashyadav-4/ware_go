@@ -17,6 +17,7 @@ import (
 	"github.com/yashyadav-4/ware_go/internal/config"
 	"github.com/yashyadav-4/ware_go/internal/repository/db"
 	"github.com/yashyadav-4/ware_go/internal/api"
+	apiMiddleware "github.com/yashyadav-4/ware_go/internal/api/middleware"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -74,6 +75,7 @@ func main(){
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(60 * time.Second))
+	r.Use(apiMiddleware.Semaphore(100 ,100 * time.Millisecond))
 
 	r.Get("/healthz" , func (w http.ResponseWriter , r *http.Request){
 		if err := pool.Ping(r.Context()); err != nil {

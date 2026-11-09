@@ -7,6 +7,7 @@ import (
 	"github.com/yashyadav-4/ware_go/internal/api/middleware"
 	"github.com/yashyadav-4/ware_go/internal/repository/db"
 	"github.com/yashyadav-4/ware_go/internal/service"
+	"github.com/yashyadav-4/ware_go/internal/strategy"
 )
 
 func RegisterRoutes(r chi.Router, pool *pgxpool.Pool, queries *db.Queries, rdb *redis.Client) {
@@ -16,9 +17,10 @@ func RegisterRoutes(r chi.Router, pool *pgxpool.Pool, queries *db.Queries, rdb *
 
 	//service layer
 	routingSvc := service.NewRoutingService(queries)
-	reservationSvc := service.NewReservationService(pool, queries , routingSvc , nil) //nil defaults to pessimistic strategy
+	adaptiveStrat := strategy.NewAdaptiveStrategy(rdb)
+	reservationSvc := service.NewReservationService(pool, queries , routingSvc , adaptiveStrat) //nil defaults to pessimistic strategy
 
-	OrderHandler := NewOrderHandler(queries , reservationSvc)
+	orderHandler := NewOrderHandler(queries , reservationSvc)
 
 	r.Route("/api/v1" , func(r chi.Router){
 		r.Route("/warehouses" , func(r chi.Router){
@@ -38,8 +40,10 @@ func RegisterRoutes(r chi.Router, pool *pgxpool.Pool, queries *db.Queries, rdb *
 		})
 
 		r.Route("/orders" , func (r chi.Router){
-			r.With(middleware.Idempotency(queries)).Post("/reserve" , OrderHandler.Reserve) //with idempotency middleware
-			r.Get("/{id}" , OrderHandler.GetOrder)
+			r.With(middleware.Idempotency(queries)).Post("/reserve" , orderHandler.Reserve) //with idempotency middleware
+			r.Get("/{id}" , orderHandler.GetOrder)
+			r.Post("/{id}/confirm", orderHandler.ConfirmOrder)
+			r.Post("/{id}/cancel", orderHandler.CancelOrder)
 		})
 	})
 }
