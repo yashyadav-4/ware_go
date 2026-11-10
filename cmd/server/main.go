@@ -13,6 +13,8 @@ import (
 	
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/yashyadav-4/ware_go/internal/worker"
+	"github.com/segmentio/kafka-go"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/yashyadav-4/ware_go/internal/config"
 	"github.com/yashyadav-4/ware_go/internal/repository/db"
@@ -68,6 +70,38 @@ func main(){
 
 
 	queries := db.New(pool)
+
+	//kafka
+	kafkaWriter := &kafka.Writer{
+		Addr: kafka.TCP(cfg.KafkaBrokers),
+		Topic: "orders.events",
+		Balancer: &kafka.LeastBytes{},
+	}
+	defer kafkaWriter.Close()
+
+	//reaper daemon for reclaiming dead reservations
+	reaper := worker.NewReaper(pool, queries, worker.ReaperConfig{
+		Interval: 1 * time.Second,
+		BatchSize: 100,
+	})
+	go reaper.Start(ctx)
+
+	//for streaming to kafka
+	outboxRelay := worker.NewOutboxRelay(pool, queries, kafkaWriter, worker.OutboxRelayConfig{
+		Interval:  500 * time.Millisecond,
+		BatchSize: 100,
+		Topic:     "orders.events",
+	})
+	go outboxRelay.Start(ctx)
+
+	//simulates third party consumer after order placement
+	kafkaReader := worker.NewKafkaReader(worker.ConsumerConfig{
+		Brokers: []string{cfg.KafkaBrokers},
+		Topic:   "orders.events",
+		GroupID: "warego.logistics.dispatcher",
+	})
+	consumer := worker.NewLogisticsConsumer(kafkaReader)
+	go consumer.Start(ctx)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)

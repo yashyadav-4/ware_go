@@ -517,7 +517,8 @@ Ware_Go/
 │   │
 │   ├── worker/
 │   │   ├── reaper.go                    # 1-second ticker, SKIP LOCKED, reclaims expired stock
-│   │   └── outbox_relay.go              # Polls outbox → Kafka, lease columns, reclaim step
+│   │   ├── outbox_relay.go              # Polls outbox → Kafka, lease columns, reclaim step
+│   │   └── consumer.go                  # 3PL logistics dispatch idempotent consumer
 │   │
 │   └── repository/
 │       ├── db/                          # sqlc-generated Go (DO NOT EDIT)
@@ -539,7 +540,10 @@ Ware_Go/
 │   ├── integration/
 │   │   ├── inventory_test.go            # CHECK constraint, restock correctness ✅
 │   │   ├── reservation_test.go          # 1,000-goroutine zero-oversell proof
-│   │   └── reaper_test.go               # Short-TTL reclaim SLA test
+│   │   ├── benchmark_test.go            # Strategy comparison & throughput benchmarks
+│   │   ├── order_lifecycle_test.go      # Confirm/Cancel state machine invariants
+│   │   ├── reaper_test.go               # Short-TTL 5s reclaim SLA test
+│   │   └── outbox_test.go               # Outbox relay, publishing & crash recovery
 │   └── k6/
 │       ├── s1_zero_oversell.js          # Claim 1
 │       ├── s3_deadlock.js               # Claim 2

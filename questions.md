@@ -44,6 +44,20 @@ A comprehensive reference of all technical, architectural, concurrency, and Go-i
 31. [What does the slice operator `hash[:]` mean? (Array vs Slice)](#31-what-does-the-slice-operator-hash-mean-array-vs-slice)
 32. [What is `.git/index.lock`, why does it get stuck, and why is deleting it safe?](#32-what-is-gitindexlock-why-does-it-get-stuck-and-why-is-deleting-it-safe)
 
+### Part 4: Asynchronous Workers, Event Streaming, Go Concurrency & Testing
+33. [Why does Redpanda need two ports (9644 vs 19092)?](#33-why-does-redpanda-need-two-ports-9644-vs-19092)
+34. [The Kafka Advertised Listener Problem: Why are `kafka-addr` and `advertise-kafka-addr` different?](#34-the-kafka-advertised-listener-problem-why-are-kafka-addr-and-advertise-kafka-addr-different)
+35. [Why can't Kafka just be a simple client-server proxy like PostgreSQL? (Direct Broker Routing vs Bottleneck Proxy)](#35-why-cant-kafka-just-be-a-simple-client-server-proxy-like-postgresql-direct-broker-routing-vs-bottleneck-proxy)
+36. [How does the Transactional Outbox Pattern work in `002_outbox.sql`, and why use a partial index (`WHERE status IN ('PENDING', 'PROCESSING')`)?](#36-how-does-the-transactional-outbox-pattern-work-in-002_outboxsql-and-why-use-a-partial-index-where-status-in-pending-processing)
+37. [What is the difference between `*testing.T` and `*testing.B`? What does `BenchmarkStrategies` actually test?](#37-what-is-the-difference-between-testingt-and-testingb-what-does-benchmarkstrategies-actually-test)
+38. [What does `<-blockChan` mean? What is the difference between an unbuffered channel and a buffered channel?](#38-what-does--blockchan-mean-what-is-the-difference-between-an-unbuffered-channel-and-a-buffered-channel)
+39. [What does `qtx := r.queries.WithTx(tx)` do?](#39-what-does-qtx--rquerieswithtxtx-do)
+40. [Why limit the Reaper to 100 orders per batch instead of reclaiming all expired orders at once?](#40-why-limit-the-reaper-to-100-orders-per-batch-instead-of-reclaiming-all-expired-orders-at-once)
+41. [What if 10,000 orders expire at once during a flash sale? Shouldn't the Reaper be Adaptive instead of fixed at 100?](#41-what-if-10000-orders-expire-at-once-during-a-flash-sale-shouldnt-the-reaper-be-adaptive-instead-of-fixed-at-100)
+42. [How does `for { select { ... } }` work in Go? Is it parallel or sequential, and how does Go decide between ready channels?](#42-how-does-for--select----work-in-go-is-it-parallel-or-sequential-and-how-does-go-decide-between-ready-channels)
+43. [What does `slog.Default().With("component", "reaper")` mean, and why use structured logging tags in production?](#43-what-does-slogdefaultwithcomponent-reaper-mean-and-why-use-structured-logging-tags-in-production)
+44. [What are the core components of a Kafka message (`Topic`, `Key`, `Value`, `Headers`, `Timestamp`), and what role does each play in Ware_Go?](#44-what-are-the-core-components-of-a-kafka-message-topic-key-value-headers-timestamp-and-what-role-does-each-play-in-ware_go)
+
 ---
 
 # Part 1: High-Level Architecture & Systems Design
@@ -492,3 +506,135 @@ If a command crashes, is killed, or hits a permission error mid-way, Git never g
 
 **Is it safe to delete?**  
 Yes. As long as no other Git command is running in another terminal, deleting `index.lock` (`del .git\index.lock`) simply clears the stale lock so Git can operate normally. No code or commit history is ever lost.
+
+---
+
+# Part 4: Asynchronous Workers, Event Streaming, Go Concurrency & Testing
+
+### 33. Why does Redpanda need two ports (9644 vs 19092)?
+
+Redpanda separates the **Data Plane** from the **Control Plane**:
+1. **Port 19092 (Kafka Wire Protocol)**: High-throughput binary protocol used strictly for publishing and consuming partition records (`OrderReserved`, `OrderFulfilled`).
+2. **Port 9644 (Admin HTTP REST API)**: Standard JSON API used by Prometheus scrapers, cluster management CLIs (`rpk cluster health`), and container healthchecks.
+
+Separating them guarantees administrative monitoring probes never compete with or slow down the high-speed binary message streaming path.
+
+---
+
+### 34. The Kafka Advertised Listener Problem: Why are `kafka-addr` and `advertise-kafka-addr` different?
+
+When a client connects to Kafka, it performs a two-step handshake:
+1. Client connects to a bootstrap broker.
+2. The broker returns **Metadata** telling the client the exact IP/port of the partition leader to send data to.
+
+If Redpanda is running inside Docker:
+* Its internal container IP is `172.18.x.x`.
+* If it returned that internal IP to a client running on Windows, the client would crash with `Connection Refused` because Windows has no route to Docker's private bridge network.
+
+**The Solution**:
+* **`--kafka-addr`**: Tells the broker what socket to bind to inside the container (`0.0.0.0:19092`).
+* **`--advertise-kafka-addr`**: Tells the broker what address to advertise back to clients in metadata responses. We advertise `OUTSIDE://localhost:19092` so host machines can connect, and `PLAINTEXT://redpanda:29092` for inter-container communication.
+
+---
+
+### 35. Why can't Kafka just be a simple client-server proxy like PostgreSQL? (Direct Broker Routing vs Bottleneck Proxy)
+
+In standard client-server databases like PostgreSQL, you send a query to port 5432, it executes, and returns.
+
+Kafka cannot do this because it is engineered for **millions of events per second across dozens of servers**:
+* If Broker 1 had to act as a proxy (accepting messages for Partition 4, forwarding them to Broker 7, waiting for ACK, and forwarding back), Broker 1 would become a massive bottleneck.
+* Instead, Kafka uses **Direct Broker Routing**: you connect to any broker once to get the cluster map, and your client then opens a **direct TCP socket to the specific broker that owns the partition**.
+* This eliminates proxy bottlenecks completely and enables linear horizontal scalability.
+
+---
+
+### 36. How does the Transactional Outbox Pattern work in `002_outbox.sql`, and why use a partial index (`WHERE status IN ('PENDING', 'PROCESSING')`)?
+
+1. **Transactional Outbox**:
+   Writing to Postgres and then calling Kafka separately creates the **Dual-Write Problem**: if the server crashes between the two writes, the order is saved in the database but the event is permanently lost from Kafka.
+   The Outbox pattern writes the event into an `outbox` table in the **same ACID transaction** as the order. A background relay worker safely streams events to Kafka with at-least-once delivery.
+2. **Why a Partial Index?**:
+   In a production system with 10,000,000 orders, 9,999,950 rows are `PUBLISHED`, and only ~50 rows are `PENDING`.
+   Indexing the entire table wastes 500 MB of RAM on dead rows. A partial index (`WHERE status IN ('PENDING', 'PROCESSING')`) indexes only active in-flight records, keeping the index tiny (kilobytes) and fitting entirely in CPU cache for instant $O(\log N)$ FIFO retrieval.
+
+---
+
+### 37. What is the difference between `*testing.T` and `*testing.B`? What does `BenchmarkStrategies` actually test?
+
+- **`*testing.T` (Correctness)**: Runs code once to assert invariants (e.g. Zero Oversell: did exactly 50 succeed and 150 fail cleanly?).
+- **`*testing.B` (Performance & Throughput)**: Runs code in an adaptive loop controlled by `b.N` across parallel goroutines (`b.RunParallel`) to measure nanoseconds per operation (`ns/op`) and throughput under sustained load.
+- In `BenchmarkStrategies`, we give it plenty of stock (`int32(b.N + 1000)`) so the benchmark measures the **speed of executing complete ACID reservations**, rather than the speed of returning "out of stock" errors.
+
+---
+
+### 38. What does `<-blockChan` mean? What is the difference between an unbuffered channel and a buffered channel?
+
+- **`<-blockChan`**: The receive operator. It pauses and freezes the goroutine until another goroutine sends data into `blockChan` or calls `close(blockChan)`.
+- **Unbuffered Channel (`make(chan T)`)**: Zero storage capacity. The sender and receiver must meet at the exact same instant (synchronous hand-to-hand handoff). If no receiver is ready, the sender blocks.
+- **Buffered Channel (`make(chan T, N)`)**: Holds up to $N$ items. Senders drop data in and continue immediately without waiting. Senders only block if all $N$ slots are full; receivers only block if the buffer is empty.
+  - In Ware_Go, our **Semaphore** is a buffered channel (`make(chan struct{}, 100)`), allowing 100 concurrent requests to pass through without waiting.
+
+---
+
+### 39. What does `qtx := r.queries.WithTx(tx)` do?
+
+`sqlc` queries normally run against the global connection pool (`pgxpool.Pool`).
+`WithTx(tx)` binds the query methods to a specific open transaction `tx`.
+Every query called on `qtx` participates in that single atomic transaction boundary. If `tx.Commit()` succeeds, all changes persist together; if any error occurs and `tx.Rollback()` runs, every change is undone cleanly.
+
+---
+
+### 40. Why limit the Reaper to 100 orders per batch instead of reclaiming all expired orders at once?
+
+If 10,000 orders expire during a flash sale and the Reaper attempts to reclaim all 10,000 in a single giant query:
+1. It holds row locks on warehouse inventory for several seconds.
+2. Live customers attempting to checkout during those seconds freeze, suffering severe p99 latency spikes.
+3. Database connections are hogged, risking connection pool exhaustion.
+
+By bounding the batch to **100 orders**:
+- The transaction commits in 10–15 milliseconds.
+- Row lock hold times are negligible.
+- Live customer checkouts are completely uninterrupted.
+
+---
+
+### 41. What if 10,000 orders expire at once during a flash sale? Shouldn't the Reaper be Adaptive instead of fixed at 100?
+
+**Yes! In high-throughput architectures, a fixed sleep causes backlog accumulation.**
+If 10,000 orders expire, waiting 1 second between 100-batches would take $10,000 / 100 = 100 \text{ seconds}$, breaching our 5-second reclaim SLA.
+
+Production systems solve this using two adaptive patterns:
+1. **Drain Loop (Zero-Sleep Backlog Draining)**:
+   If a cycle reaped **exactly 100 orders** (`reapedCount == batchSize`), it signals that a backlog exists. The Reaper **does not sleep**. It immediately loops to fetch the next 100.
+   Because each 100-batch takes ~10ms, it executes 50–70 batches per second, reclaiming 5,000–7,000 orders/sec and clearing 10,000 orders in **under 2 seconds**!
+2. **Pool-Aware Dynamic Scaling**:
+   The worker inspects `pool.Stat().IdleConns()`. If idle connections are high (e.g. 20 of 25 connections free), the batch size dynamically expands (e.g. to 250 or 500). If live traffic spikes and idle connections drop, the Reaper throttles its batch size to protect live customer traffic.
+
+---
+
+### 42. How does `for { select { ... } }` work in Go? Is it parallel or sequential, and how does Go decide between ready channels?
+
+1. **Execution Model**: A single goroutine is **strictly sequential**. When `select` activates a case, the goroutine executes that case to completion before looping back. Incoming messages on other channels wait in their buffers.
+2. **Channel Selection Rule**: If multiple channels have data ready simultaneously, Go **picks one uniformly at random**.
+   - **Why? To prevent Channel Starvation (Priority Inversion)**. If Go evaluated cases in code order, a high-frequency channel on line 1 would permanently starve cases on lines 2 and 3. Random selection guarantees mathematical fairness.
+
+---
+
+### 43. What does `slog.Default().With("component", "reaper")` mean, and why use structured logging tags in production?
+
+- `slog.Default()` returns the application's global JSON structured logger.
+- `.With("component", "reaper")` creates a child logger that permanently attaches `"component": "reaper"` as a metadata attribute to every log entry.
+- **Production Value**: Under 10,000 RPS, thousands of log lines fly by every second. In log aggregators (Datadog, Loki, CloudWatch), engineers can instantly isolate worker logs using queries like `component = "reaper" AND level = "ERROR"` without grepping through millions of unrelated HTTP logs.
+
+---
+
+### 44. What are the core components of a Kafka message (`Topic`, `Key`, `Value`, `Headers`, `Timestamp`), and what role does each play in Ware_Go?
+
+A Kafka record consists of 5 fundamental parts:
+1. **`Topic`** (`string`): The logical category/channel the message belongs to. In Ware_Go, we use the unified event stream `orders.events` so all lifecycle stages of an order land on the same stream.
+2. **`Key`** (`[]byte`): The partition routing key. We set `Key = []byte(event.AggregateID)` (the `order_id`). Kafka hashes this key using Murmur2 to determine the exact partition. Because the key is identical across an order's lifecycle, `OrderReserved`, `OrderFulfilled`, and `OrderCancelled` are guaranteed to land on the **same partition and be consumed in strict chronological order**.
+3. **`Value`** (`[]byte`): The main business payload (JSON binary data). Contains the full snapshot of customer ID, destination latitude/longitude, warehouse allocations, quantities, and prices.
+4. **`Headers`** (`[]kafka.Header`): Key-value metadata attached to the envelope without deserializing the full body. We include:
+   - `event_type`: e.g. `"OrderFulfilled"`, `"OrderCancelled"`. Downstream microservices inspect this header to route to specific handlers without parsing the entire JSON payload.
+   - `aggregate_type`: e.g. `"ORDER"`. Identifies the domain aggregate root.
+5. **`Time`** (`time.Time`): The creation timestamp, recording exactly when the event was emitted by the Outbox Relay. Downstream consumers use this to measure event propagation lag.

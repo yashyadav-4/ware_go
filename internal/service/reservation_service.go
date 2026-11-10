@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"encoding/json"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/yashyadav-4/ware_go/internal/repository/db"
 	"github.com/yashyadav-4/ware_go/internal/strategy"
@@ -204,6 +206,27 @@ func (s *ReservationService) ConfirmOrder(ctx context.Context , orderID pgtype.U
 	if err != nil {
 		return nil , fmt.Errorf("failed to update order status: %w" , err)
 	}
+	
+	//for kafka outbox
+	orderIDStr := uuid.UUID(order.ID.Bytes).String()
+	payloadBytes , _ := json.Marshal(map[string] interface{}{
+		"order_id":     orderIDStr,
+		"customer_id":  uuid.UUID(order.CustomerID.Bytes).String(),
+		"status":       "CONFIRMED",
+		"items_count":  len(items),
+		"confirmed_at": time.Now().UTC(),
+	})
+
+	_, err = qtx.InsertOutboxEvent(ctx, db.InsertOutboxEventParams{
+		AggregateType: "ORDER",
+		AggregateID:   orderIDStr,
+		EventType:     "OrderFulfilled",
+		Payload:       payloadBytes,
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to write outbox event: %w", err)
+	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil , fmt.Errorf("failed to commit order confirmation: %w" , err)
@@ -275,6 +298,24 @@ func (s *ReservationService)CancelOrder(ctx context.Context, orderID pgtype.UUID
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to update order status: %w", err)
+	}
+
+		orderIDStr := uuid.UUID(order.ID.Bytes).String()
+	payloadBytes, _ := json.Marshal(map[string]interface{}{
+		"order_id":     orderIDStr,
+		"customer_id":  uuid.UUID(order.CustomerID.Bytes).String(),
+		"status":       "CANCELLED",
+		"cancelled_at": time.Now().UTC(),
+	})
+
+	_, err = qtx.InsertOutboxEvent(ctx, db.InsertOutboxEventParams{
+		AggregateType: "ORDER",
+		AggregateID:   orderIDStr,
+		EventType:     "OrderCancelled",
+		Payload:       payloadBytes,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to write outbox event: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {

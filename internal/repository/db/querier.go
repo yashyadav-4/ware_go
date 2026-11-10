@@ -18,6 +18,7 @@ type Querier interface {
 	CreateOrderItem(ctx context.Context, arg CreateOrderItemParams) (OrderItem, error)
 	CreateProduct(ctx context.Context, arg CreateProductParams) (Product, error)
 	CreateWarehouse(ctx context.Context, arg CreateWarehouseParams) (Warehouse, error)
+	FetchPendingOutboxEvents(ctx context.Context, limit int32) ([]Outbox, error)
 	GetIdempotencyKey(ctx context.Context, key string) (IdempotencyKey, error)
 	GetInventoryByWarehouseAndSKU(ctx context.Context, arg GetInventoryByWarehouseAndSKUParams) (InventoryItem, error)
 	GetInventoryForUpdate(ctx context.Context, arg GetInventoryForUpdateParams) (InventoryItem, error)
@@ -25,12 +26,17 @@ type Querier interface {
 	GetProductBySKU(ctx context.Context, sku string) (Product, error)
 	GetWarehouseByCode(ctx context.Context, code string) (Warehouse, error)
 	GetWarehouseByID(ctx context.Context, id pgtype.UUID) (Warehouse, error)
+	IncrementOutboxAttempts(ctx context.Context, id pgtype.UUID) error
 	InsertAuditlog(ctx context.Context, arg InsertAuditlogParams) (InventoryAuditLog, error)
+	InsertOutboxEvent(ctx context.Context, arg InsertOutboxEventParams) (Outbox, error)
 	ListActiveWarehouses(ctx context.Context) ([]Warehouse, error)
 	ListAvailableWarehousesForSku(ctx context.Context, sku string) ([]ListAvailableWarehousesForSkuRow, error)
+	ListExpiredOrdersForReclaim(ctx context.Context, limit int32) ([]ListExpiredOrdersForReclaimRow, error)
 	ListInventoryBySKU(ctx context.Context, sku string) ([]ListInventoryBySKURow, error)
 	ListOrderItems(ctx context.Context, orderID pgtype.UUID) ([]OrderItem, error)
 	ListProducts(ctx context.Context) ([]Product, error)
+	MarkOutboxEventPublished(ctx context.Context, id pgtype.UUID) error
+	ReclaimStaleOutboxLeases(ctx context.Context) error
 	ReserveInventoryStock(ctx context.Context, arg ReserveInventoryStockParams) (InventoryItem, error)
 	ReserveInventoryStockAtomic(ctx context.Context, arg ReserveInventoryStockAtomicParams) (InventoryItem, error)
 	ReserveInventoryStockOptimistic(ctx context.Context, arg ReserveInventoryStockOptimisticParams) (InventoryItem, error)

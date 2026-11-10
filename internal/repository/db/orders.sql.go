@@ -171,6 +171,41 @@ func (q *Queries) ListAvailableWarehousesForSku(ctx context.Context, sku string)
 	return items, nil
 }
 
+const listExpiredOrdersForReclaim = `-- name: ListExpiredOrdersForReclaim :many
+SELECT id, status , expires_at
+FROM orders
+WHERE status = 'RESERVED' AND expires_at < NOW()
+ORDER BY expires_at ASC
+FOR UPDATE SKIP LOCKED
+LIMIT $1
+`
+
+type ListExpiredOrdersForReclaimRow struct {
+	ID        pgtype.UUID        `json:"id"`
+	Status    OrderStatus        `json:"status"`
+	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+}
+
+func (q *Queries) ListExpiredOrdersForReclaim(ctx context.Context, limit int32) ([]ListExpiredOrdersForReclaimRow, error) {
+	rows, err := q.db.Query(ctx, listExpiredOrdersForReclaim, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListExpiredOrdersForReclaimRow
+	for rows.Next() {
+		var i ListExpiredOrdersForReclaimRow
+		if err := rows.Scan(&i.ID, &i.Status, &i.ExpiresAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listOrderItems = `-- name: ListOrderItems :many
 SELECT id, order_id, warehouse_id, sku, quantity FROM order_items WHERE order_id = $1
 `

@@ -50,3 +50,12 @@ WHERE i.sku = $1
     AND w.is_active = TRUE
     AND i.available_qty > 0
 ORDER BY i.available_qty DESC;
+
+
+-- name: ListExpiredOrdersForReclaim :many
+SELECT id, status , expires_at
+FROM orders
+WHERE status = 'RESERVED' AND expires_at < NOW()
+ORDER BY expires_at ASC
+FOR UPDATE SKIP LOCKED
+LIMIT $1;

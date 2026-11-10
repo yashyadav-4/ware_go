@@ -56,6 +56,50 @@ func (ns NullOrderStatus) Value() (driver.Value, error) {
 	return string(ns.OrderStatus), nil
 }
 
+type OutboxStatus string
+
+const (
+	OutboxStatusPENDING    OutboxStatus = "PENDING"
+	OutboxStatusPROCESSING OutboxStatus = "PROCESSING"
+	OutboxStatusPUBLISHED  OutboxStatus = "PUBLISHED"
+	OutboxStatusFAILED     OutboxStatus = "FAILED"
+)
+
+func (e *OutboxStatus) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = OutboxStatus(s)
+	case string:
+		*e = OutboxStatus(s)
+	default:
+		return fmt.Errorf("unsupported scan type for OutboxStatus: %T", src)
+	}
+	return nil
+}
+
+type NullOutboxStatus struct {
+	OutboxStatus OutboxStatus `json:"outbox_status"`
+	Valid        bool         `json:"valid"` // Valid is true if OutboxStatus is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullOutboxStatus) Scan(value interface{}) error {
+	if value == nil {
+		ns.OutboxStatus, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.OutboxStatus.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullOutboxStatus) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.OutboxStatus), nil
+}
+
 type IdempotencyKey struct {
 	Key            string             `json:"key"`
 	RequestHash    string             `json:"request_hash"`
@@ -106,6 +150,20 @@ type OrderItem struct {
 	WarehouseID pgtype.UUID `json:"warehouse_id"`
 	Sku         string      `json:"sku"`
 	Quantity    int32       `json:"quantity"`
+}
+
+type Outbox struct {
+	ID            pgtype.UUID        `json:"id"`
+	AggregateType string             `json:"aggregate_type"`
+	AggregateID   string             `json:"aggregate_id"`
+	EventType     string             `json:"event_type"`
+	Payload       []byte             `json:"payload"`
+	Status        OutboxStatus       `json:"status"`
+	Attempts      int32              `json:"attempts"`
+	LockedAt      pgtype.Timestamptz `json:"locked_at"`
+	LockedBy      pgtype.Text        `json:"locked_by"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 }
 
 type Product struct {

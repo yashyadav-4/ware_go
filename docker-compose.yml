@@ -32,6 +32,30 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.1.8
+    container_name: Ware_Go_redpanda
+    restart: unless-stopped
+    command:
+      - redpanda start
+      - --smp 1 # symmetric multiprocessing -> limits at max 1 thread out of my 12 threads 
+      - --memory 512M #can consume at max 512mb ram
+      - --reserve-memory 0M #tells redpanda to not lock os memory in advance
+      - --overprovisioned #for local development to tell redpanda its not a server and not overconsume resources
+      - --node-id 0 #id of our kafka broker
+      - --kafka-addr PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:19092 # main place where we get which broker is handling which partition
+      - --advertise-kafka-addr PLAINTEXT://redpanda:29092,OUTSIDE://localhost:19092 # our partition port
+    ports:
+      - "19092:19092" #normal message port
+      - "9644:9644" #admin port
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 volumes:
   postgres_data:
   redis_data:
+  redpanda_data:

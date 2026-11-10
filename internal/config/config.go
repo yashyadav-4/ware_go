@@ -8,6 +8,7 @@ type Config struct {
 	Port string
 	DatabaseURL string
 	RedisAddr string
+	KafkaBrokers string
 }
 
 func Load() *Config{
@@ -26,9 +27,15 @@ func Load() *Config{
 		redisAddr = "localhost:6379"
 	}
 
+	kafkaBrokers := os.Getenv("KAFKA_BROKERS")
+	if kafkaBrokers == ""{
+		kafkaBrokers = "localhost:19092"
+	}
+
 	return &Config{
 		Port: port,
 		DatabaseURL: dbURL,
 		RedisAddr: redisAddr,
+		KafkaBrokers: kafkaBrokers,
 	}
 }
