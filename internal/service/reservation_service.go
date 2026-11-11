@@ -6,7 +6,9 @@ import (
 	"sort"
 	"encoding/json"
 	"time"
+	"strings"
 
+	"github.com/yashyadav-4/ware_go/internal/metrics"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -46,7 +48,27 @@ func NewReservationService( pool *pgxpool.Pool, queries *db.Queries, routingSvc 
 	}
 }
 
-func (s *ReservationService) ReserveOrder(ctx context.Context , req ReserveOrderRequest) (*ReserveOrderResponse , error){
+func (s *ReservationService) ReserveOrder(ctx context.Context , req ReserveOrderRequest) (res *ReserveOrderResponse ,err error){
+
+	start := time.Now()
+	defer func(){
+		duration := time.Since(start).Seconds()
+		status := "success"
+		if err != nil{
+			status = "error"
+			if strings.Contains(err.Error(), "OUT_OF_STOCK") || strings.Contains(err.Error(), "insufficient") {
+				status = "out_of_stock"
+			}	
+		}
+
+		stratName := "adaptive"
+		if res != nil && res.Strategy != "" {
+			stratName = res.Strategy
+		}
+
+		metrics.ReservationDuration.WithLabelValues(stratName , status).Observe(duration)
+		metrics.ReservationsTotal.WithLabelValues(stratName , status).Inc()
+	}()
 	
 	allocations , err := s.routingSvc.PlanAllocation(ctx, req.CustomerLat , req.CustomerLon , req.Items)
 	if err != nil {

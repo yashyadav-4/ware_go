@@ -4,6 +4,8 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"   
+	
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -35,6 +37,7 @@ type ReserveOrderPayload struct {
 	DestLatitude  float64            `json:"dest_latitude"`
 	DestLongitude float64            `json:"dest_longitude"`
 	Items         []OrderItemPayload `json:"items"`
+	TTLSeconds    int64              `json:"ttl_seconds"`
 }
 
 type OrderDetailResponse struct {
@@ -86,12 +89,18 @@ func (h *OrderHandler) Reserve(w http.ResponseWriter , r *http.Request){
 
 	idempotencyKey := r.Header.Get("Idempotency-Key")
 
+	var reqTTL time.Duration
+	if payload.TTLSeconds > 0 {
+		reqTTL = time.Duration(payload.TTLSeconds) * time.Second
+	}
+
 	result , err := h.reservationSvc.ReserveOrder(r.Context() , service.ReserveOrderRequest{
 		IdempotencyKey: idempotencyKey,
 		CustomerID:     custUUID,
 		CustomerLat:    payload.DestLatitude,
 		CustomerLon:    payload.DestLongitude,
 		Items:          items,
+		TTL:            reqTTL,
 	})
 
 

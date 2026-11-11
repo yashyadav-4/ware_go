@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/yashyadav-4/ware_go/internal/config"
 	"github.com/yashyadav-4/ware_go/internal/repository/db"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/yashyadav-4/ware_go/internal/api"
 	apiMiddleware "github.com/yashyadav-4/ware_go/internal/api/middleware"
 	"github.com/redis/go-redis/v9"
@@ -73,8 +74,7 @@ func main(){
 
 	//kafka
 	kafkaWriter := &kafka.Writer{
-		Addr: kafka.TCP(cfg.KafkaBrokers),
-		Topic: "orders.events",
+		Addr:     kafka.TCP(cfg.KafkaBrokers),
 		Balancer: &kafka.LeastBytes{},
 	}
 	defer kafkaWriter.Close()
@@ -110,6 +110,7 @@ func main(){
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(60 * time.Second))
 	r.Use(apiMiddleware.Semaphore(100 ,100 * time.Millisecond))
+	r.Mount("/debug", middleware.Profiler())
 
 	r.Get("/healthz" , func (w http.ResponseWriter , r *http.Request){
 		if err := pool.Ping(r.Context()); err != nil {
@@ -126,6 +127,8 @@ func main(){
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"ok"}`))
 	})
+
+	r.Handle("/metrics", promhttp.Handler())
 
 	api.RegisterRoutes(r, pool , queries , rdb)
 

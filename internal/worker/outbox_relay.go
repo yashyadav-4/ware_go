@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/segmentio/kafka-go"
+	"github.com/yashyadav-4/ware_go/internal/metrics"
 	"github.com/yashyadav-4/ware_go/internal/repository/db"
 )
 
@@ -122,6 +123,7 @@ func (r *OutboxRelay) ProcessPendingEvents(ctx context.Context) (int, error) {
 		}
 
 		if err := r.writer.WriteMessages(ctx, msg); err != nil {
+			metrics.OutboxEventsTotal.WithLabelValues("failed", event.EventType).Inc()
 			r.logger.Error("failed to publish event to kafka; incrementing attempts",
 				"event_id", event.ID, "error", err)
 
@@ -134,6 +136,7 @@ func (r *OutboxRelay) ProcessPendingEvents(ctx context.Context) (int, error) {
 		if err := qtx.MarkOutboxEventPublished(ctx, event.ID); err != nil {
 			return 0, fmt.Errorf("failed to mark event %v published: %w", event.ID, err)
 		}
+		metrics.OutboxEventsTotal.WithLabelValues("published", event.EventType).Inc()
 	}
 
 	if err := tx.Commit(ctx); err != nil {

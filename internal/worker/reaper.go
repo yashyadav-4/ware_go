@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/yashyadav-4/ware_go/internal/metrics"
 	"github.com/yashyadav-4/ware_go/internal/repository/db"
 )
 
@@ -57,12 +58,17 @@ func (r *Reaper) Start(ctx context.Context){
 				if ctx.Err() != nil{
 					return
 				}
+				
+				start := time.Now()
 				reapedCount , err := r.ReapExpiredOrders(ctx)
+				metrics.ReaperCycleDuration.Observe(time.Since(start).Seconds())
+
 				if err != nil{
 					r.logger.Error("reaper cycle failed" , "error", err)
 					break
 				}
 				if reapedCount > 0 {
+					metrics.ReaperReclaimedTotal.Add(float64(reapedCount))
 					r.logger.Info("reaped expired orders" , "count" , reapedCount)
 				}
 
