@@ -22,6 +22,7 @@ import (
 	"github.com/yashyadav-4/ware_go/internal/api"
 	apiMiddleware "github.com/yashyadav-4/ware_go/internal/api/middleware"
 	"github.com/redis/go-redis/v9"
+	"github.com/yashyadav-4/ware_go/internal/agent"
 )
 
 func main(){
@@ -130,13 +131,14 @@ func main(){
 
 	r.Handle("/metrics", promhttp.Handler())
 
-	api.RegisterRoutes(r, pool , queries , rdb)
+	rebalancer := agent.NewRebalancer(pool, queries, cfg.GeminiAPIKey, cfg.GeminiModel)
+	api.RegisterRoutes(r, pool, queries, rdb, rebalancer)
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", cfg.Port),
 		Handler:      r,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 

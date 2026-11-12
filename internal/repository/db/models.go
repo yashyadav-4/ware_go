@@ -173,6 +173,15 @@ type Product struct {
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 }
 
+type RebalanceProposal struct {
+	ID            pgtype.UUID        `json:"id"`
+	Status        string             `json:"status"`
+	Analysis      string             `json:"analysis"`
+	ProposalsJson []byte             `json:"proposals_json"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	ExecutedAt    pgtype.Timestamptz `json:"executed_at"`
+}
+
 type Warehouse struct {
 	ID        pgtype.UUID        `json:"id"`
 	Code      string             `json:"code"`

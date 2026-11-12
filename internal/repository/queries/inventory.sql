@@ -96,3 +96,44 @@ SET available_qty = available_qty + $3,
     updated_at = NOW()
 WHERE warehouse_id = $1 AND sku = $2
 RETURNING *;
+
+
+-- name: ListAllInventory :many
+SELECT i.warehouse_id, w.name as warehouse_name, w.code as warehouse_code,
+       w.latitude, w.longitude, i.sku, i.available_qty, i.reserved_qty
+FROM inventory_items i
+JOIN warehouses w ON i.warehouse_id = w.id
+WHERE w.is_active = TRUE
+ORDER BY i.sku ASC, i.available_qty DESC;
+
+
+-- name: DeductInventoryStock :one
+UPDATE inventory_items
+SET available_qty = available_qty - $3,
+    version = version + 1,
+    updated_at = NOW()
+WHERE warehouse_id = $1 AND sku = $2 AND available_qty >= $3
+RETURNING *;
+
+
+-- name: InsertRebalanceProposal :one
+INSERT INTO rebalance_proposals (
+    analysis,
+    proposals_json,
+    status
+) VALUES (
+    $1, $2, 'PENDING'
+)
+RETURNING *;
+
+-- name: GetLatestRebalanceProposal :one
+SELECT * FROM rebalance_proposals
+ORDER BY created_at DESC
+LIMIT 1;
+
+-- name: MarkRebalanceProposalExecuted :one
+UPDATE rebalance_proposals
+SET status = 'EXECUTED',
+    executed_at = NOW()
+WHERE id = $1
+RETURNING *;

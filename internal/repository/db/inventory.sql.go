@@ -41,6 +41,36 @@ func (q *Queries) ConfirmInventoryStock(ctx context.Context, arg ConfirmInventor
 	return i, err
 }
 
+const deductInventoryStock = `-- name: DeductInventoryStock :one
+UPDATE inventory_items
+SET available_qty = available_qty - $3,
+    version = version + 1,
+    updated_at = NOW()
+WHERE warehouse_id = $1 AND sku = $2 AND available_qty >= $3
+RETURNING id, warehouse_id, sku, available_qty, reserved_qty, version, updated_at
+`
+
+type DeductInventoryStockParams struct {
+	WarehouseID  pgtype.UUID `json:"warehouse_id"`
+	Sku          string      `json:"sku"`
+	AvailableQty int32       `json:"available_qty"`
+}
+
+func (q *Queries) DeductInventoryStock(ctx context.Context, arg DeductInventoryStockParams) (InventoryItem, error) {
+	row := q.db.QueryRow(ctx, deductInventoryStock, arg.WarehouseID, arg.Sku, arg.AvailableQty)
+	var i InventoryItem
+	err := row.Scan(
+		&i.ID,
+		&i.WarehouseID,
+		&i.Sku,
+		&i.AvailableQty,
+		&i.ReservedQty,
+		&i.Version,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getInventoryByWarehouseAndSKU = `-- name: GetInventoryByWarehouseAndSKU :one
 SELECT id, warehouse_id, sku, available_qty, reserved_qty, version, updated_at FROM inventory_items WHERE warehouse_id = $1 AND sku = $2 LIMIT 1
 `
@@ -85,6 +115,26 @@ func (q *Queries) GetInventoryForUpdate(ctx context.Context, arg GetInventoryFor
 		&i.ReservedQty,
 		&i.Version,
 		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getLatestRebalanceProposal = `-- name: GetLatestRebalanceProposal :one
+SELECT id, status, analysis, proposals_json, created_at, executed_at FROM rebalance_proposals
+ORDER BY created_at DESC
+LIMIT 1
+`
+
+func (q *Queries) GetLatestRebalanceProposal(ctx context.Context) (RebalanceProposal, error) {
+	row := q.db.QueryRow(ctx, getLatestRebalanceProposal)
+	var i RebalanceProposal
+	err := row.Scan(
+		&i.ID,
+		&i.Status,
+		&i.Analysis,
+		&i.ProposalsJson,
+		&i.CreatedAt,
+		&i.ExecutedAt,
 	)
 	return i, err
 }
@@ -136,6 +186,85 @@ func (q *Queries) InsertAuditlog(ctx context.Context, arg InsertAuditlogParams) 
 	return i, err
 }
 
+const insertRebalanceProposal = `-- name: InsertRebalanceProposal :one
+INSERT INTO rebalance_proposals (
+    analysis,
+    proposals_json,
+    status
+) VALUES (
+    $1, $2, 'PENDING'
+)
+RETURNING id, status, analysis, proposals_json, created_at, executed_at
+`
+
+type InsertRebalanceProposalParams struct {
+	Analysis      string `json:"analysis"`
+	ProposalsJson []byte `json:"proposals_json"`
+}
+
+func (q *Queries) InsertRebalanceProposal(ctx context.Context, arg InsertRebalanceProposalParams) (RebalanceProposal, error) {
+	row := q.db.QueryRow(ctx, insertRebalanceProposal, arg.Analysis, arg.ProposalsJson)
+	var i RebalanceProposal
+	err := row.Scan(
+		&i.ID,
+		&i.Status,
+		&i.Analysis,
+		&i.ProposalsJson,
+		&i.CreatedAt,
+		&i.ExecutedAt,
+	)
+	return i, err
+}
+
+const listAllInventory = `-- name: ListAllInventory :many
+SELECT i.warehouse_id, w.name as warehouse_name, w.code as warehouse_code,
+       w.latitude, w.longitude, i.sku, i.available_qty, i.reserved_qty
+FROM inventory_items i
+JOIN warehouses w ON i.warehouse_id = w.id
+WHERE w.is_active = TRUE
+ORDER BY i.sku ASC, i.available_qty DESC
+`
+
+type ListAllInventoryRow struct {
+	WarehouseID   pgtype.UUID `json:"warehouse_id"`
+	WarehouseName string      `json:"warehouse_name"`
+	WarehouseCode string      `json:"warehouse_code"`
+	Latitude      float64     `json:"latitude"`
+	Longitude     float64     `json:"longitude"`
+	Sku           string      `json:"sku"`
+	AvailableQty  int32       `json:"available_qty"`
+	ReservedQty   int32       `json:"reserved_qty"`
+}
+
+func (q *Queries) ListAllInventory(ctx context.Context) ([]ListAllInventoryRow, error) {
+	rows, err := q.db.Query(ctx, listAllInventory)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAllInventoryRow
+	for rows.Next() {
+		var i ListAllInventoryRow
+		if err := rows.Scan(
+			&i.WarehouseID,
+			&i.WarehouseName,
+			&i.WarehouseCode,
+			&i.Latitude,
+			&i.Longitude,
+			&i.Sku,
+			&i.AvailableQty,
+			&i.ReservedQty,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listInventoryBySKU = `-- name: ListInventoryBySKU :many
 SELECT i.id, i.warehouse_id, i.sku, i.available_qty, i.reserved_qty, i.version, i.updated_at , w.name as warehouse_name , w.code as warehouse_code
 FROM inventory_items i
@@ -184,6 +313,28 @@ func (q *Queries) ListInventoryBySKU(ctx context.Context, sku string) ([]ListInv
 		return nil, err
 	}
 	return items, nil
+}
+
+const markRebalanceProposalExecuted = `-- name: MarkRebalanceProposalExecuted :one
+UPDATE rebalance_proposals
+SET status = 'EXECUTED',
+    executed_at = NOW()
+WHERE id = $1
+RETURNING id, status, analysis, proposals_json, created_at, executed_at
+`
+
+func (q *Queries) MarkRebalanceProposalExecuted(ctx context.Context, id pgtype.UUID) (RebalanceProposal, error) {
+	row := q.db.QueryRow(ctx, markRebalanceProposalExecuted, id)
+	var i RebalanceProposal
+	err := row.Scan(
+		&i.ID,
+		&i.Status,
+		&i.Analysis,
+		&i.ProposalsJson,
+		&i.CreatedAt,
+		&i.ExecutedAt,
+	)
+	return i, err
 }
 
 const reserveInventoryStock = `-- name: ReserveInventoryStock :one

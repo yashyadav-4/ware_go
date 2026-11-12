@@ -1,11 +1,14 @@
 # Ware_Go — Multi-Warehouse Inventory & Order Fulfillment Engine
 
-> A high-concurrency backend system in **Go** and **PostgreSQL** that manages inventory across distributed warehouses and processes thousands of concurrent order reservations — **without ever overselling a single unit**.
+> A high-concurrency backend system in **Go** and **PostgreSQL** that manages inventory across distributed warehouses and processes thousands of concurrent order reservations — **without ever overselling a single unit**. Engineered with ACID transactions, pluggable concurrency strategies, transactional outbox streaming, background stock reapers, and full Prometheus/Grafana observability.
 
 [![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go)](https://golang.org)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-336791?logo=postgresql)](https://postgresql.org)
 [![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis)](https://redis.io)
 [![Kafka](https://img.shields.io/badge/Kafka-Redpanda-FF6B35?logo=apachekafka)](https://redpanda.com)
+[![Prometheus](https://img.shields.io/badge/Prometheus-v2.54-E6522C?logo=prometheus)](https://prometheus.io)
+[![Grafana](https://img.shields.io/badge/Grafana-11.2-F46800?logo=grafana)](https://grafana.com)
+[![k6](https://img.shields.io/badge/k6-Load_Testing-7D64FF?logo=k6)](https://k6.io)
 
 ---
 
@@ -22,10 +25,13 @@
   - [6. Semaphore-Based Load Shedding](#6-semaphore-based-load-shedding)
   - [7. Redis Read-Through Cache with Write Invalidation](#7-redis-read-through-cache-with-write-invalidation)
   - [8. Deadlock-Immune Row Ordering](#8-deadlock-immune-row-ordering)
-  - [9. Defensive Data Integrity](#9-defensive-data-integrity)
+  - [9. Defensive Multi-Layer Data Integrity](#9-defensive-multi-layer-data-integrity)
+  - [10. Real-Time Observability & Profiling (Prometheus + Grafana + pprof)](#10-real-time-observability--profiling-prometheus--grafana--pprof)
 - [Scalability & Performance](#scalability--performance)
 - [Database Schema Design](#database-schema-design)
-- [Testing Strategy](#testing-strategy)
+- [Testing & Verification Suite](#testing--verification-suite)
+  - [Unit & Integration Tests (Go)](#unit--integration-tests-go)
+  - [Automated k6 Load & Chaos Suite](#automated-k6-load--chaos-suite)
 - [API Reference](#api-reference)
 - [Tech Stack](#tech-stack)
 - [Project Structure](#project-structure)
@@ -37,70 +43,79 @@
 
 ## What It Does
 
-Ware_Go solves the core problem behind every e-commerce flash sale, limited-edition drop, and multi-warehouse fulfillment system: **how do you let thousands of customers race for the same limited inventory — simultaneously, correctly, and without selling units that don't exist?**
+Ware_Go solves the core problem behind e-commerce flash sales, high-demand product drops, and multi-warehouse logistics networks: **how do you allow thousands of customers to race for the exact same limited inventory — simultaneously, across multiple geographic nodes, with zero overselling, zero deadlocks, and immediate recovery from failures?**
 
-It handles the full order lifecycle:
+It handles the complete order lifecycle:
 
-1. **Route** each order to the optimal warehouse(s) based on customer proximity and stock availability
-2. **Reserve** inventory inside strict ACID transactions using an adaptive concurrency strategy
-3. **Confirm** or **Cancel** orders with full stock rollback and audit trails
-4. **Reclaim** abandoned reservations automatically via a background reaper daemon
-5. **Publish** every lifecycle event to downstream systems via the Transactional Outbox pattern — even if Kafka is temporarily down
+1. **Route** incoming orders to optimal warehouse(s) via a weighted cost function balancing customer proximity (Haversine distance) and inventory depth.
+2. **Reserve** stock inside strict ACID database transactions using a pluggable, adaptive concurrency engine (`Atomic`, `Optimistic CAS with Jitter`, or `Pessimistic FOR UPDATE`).
+3. **Confirm** or **Cancel** orders with zero-loss rollback, audit ledger writes, and status state machine validation.
+4. **Reclaim** abandoned or expired cart reservations automatically through an autonomous background reaper daemon (`SLA < 5s`).
+5. **Stream** fulfillment and cancellation events to downstream microservices and 3PL carriers via the **Transactional Outbox Pattern** — guaranteeing zero lost events even if Kafka crashes mid-flight.
+6. **Observe & Profile** system vitals in real time through fine-grained Prometheus metrics, pre-configured Grafana dashboards, and live Go pprof endpoints.
 
 ---
 
 ## System Architecture
 
 ```
-┌──────────────────────────────────────────────┐
-│              Client / HTTP                   │
-└────────────────────┬─────────────────────────┘
-                     │
-       ┌─────────────▼──────────────┐
-       │      chi Router            │
-       │  ┌──────────┐ ┌─────────┐  │
-       │  │Semaphore  │ │Idempot. │  │
-       │  │  (load    │ │  (SHA-  │  │
-       │  │ shedding) │ │  256 +  │  │
-       │  │  100 max  │ │ replay) │  │
-       │  └──────────┘ └─────────┘  │
-       └─────────────┬──────────────┘
-                     │
-     ┌───────────────▼────────────────┐
-     │         Service Layer          │
-     │  RoutingService → cost(d,s)    │
-     │  ReservationService → ACID tx  │
-     └───────────┬───────────┬────────┘
-                 │           │
-    ┌────────────▼──┐  ┌─────▼──────────┐
-    │  Adaptive     │  │  PostgreSQL 16  │
-    │  Strategy     │  │                 │
-    │ ┌───────────┐ │  │  inventory      │
-    │ │Pessimistic│ │  │  orders         │
-    │ │(FOR UPDT) │ │  │  outbox         │
-    │ ├───────────┤ │  │  audit_log      │
-    │ │Optimistic │ │  │  idempotency    │
-    │ │(CAS+Retry)│ │  └────────┬────────┘
-    │ ├───────────┤ │           │
-    │ │  Atomic   │ │  ┌────────▼────────┐
-    │ │(WHERE >=) │ │  │  Redis 7        │
-    │ └───────────┘ │  │  • read cache   │
-    └───────────────┘  │  • contention   │
-                       │    rate counter │
-                       └────────┬────────┘
-                                │
-        ┌───────────────────────┼────────────────────┐
-        │                       │                    │
-┌───────▼────────┐  ┌───────────▼──────┐  ┌──────────▼─────────┐
-│  Outbox Relay  │  │   Reaper Daemon  │  │  Kafka Consumer    │
-│  (500ms poll,  │  │  (1s poll,       │  │  (3PL logistics    │
-│  batch 100,    │  │  batch 100,      │  │   dispatcher,      │
-│  SKIP LOCKED)  │  │  SKIP LOCKED,    │  │   dedup by key)    │
-│       │        │  │  TTL rollback)   │  └────────────────────┘
-│       ▼        │  └──────────────────┘
-│  Redpanda/     │
-│  Kafka         │
-└────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│              Client / k6 Load Generator                     │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+               ┌───────────────▼──────────────┐
+               │         chi Router           │
+               │  ┌──────────┐ ┌───────────┐  │
+               │  │Semaphore │ │Idempotency│  │
+               │  │  (100    │ │  (SHA-256 │  │
+               │  │ in-flight│ │  finger-  │  │
+               │  │ admission│ │  printing)│  │
+               │  └──────────┘ └───────────┘  │
+               │  ┌──────────┐ ┌───────────┐  │
+               │  │ /metrics │ │ /debug/   │  │
+               │  │(Prometh.)│ │   pprof   │  │
+               │  └──────────┘ └───────────┘  │
+               └───────────────┬──────────────┘
+                               │
+         ┌─────────────────────▼──────────────────────┐
+         │               Service Layer                │
+         │  • RoutingService   → cost(distance, stock)│
+         │  • ReservationService → ACID Orchestration │
+         └─────────────┬──────────────────────┬───────┘
+                       │                      │
+        ┌──────────────▼──────┐        ┌──────▼───────────────────┐
+        │  Adaptive Strategy  │        │      PostgreSQL 16       │
+        │ ┌─────────────────┐ │        │                          │
+        │ │   Pessimistic   │ │        │  • warehouses, products  │
+        │ │ (FOR UPDATE)    │ │        │  • inventory_items       │
+        │ ├─────────────────┤ │        │  • orders & order_items  │
+        │ │ Optimistic CAS  │ │        │  • transactional outbox  │
+        │ │(Version+Jitter) │ │        │  • inventory_audit_log   │
+        │ ├─────────────────┤ │        │  • idempotency_key store │
+        │ │  Atomic Cond.   │ │        └────────────┬─────────────┘
+        │ │(WHERE avail>=N) │ │                     │
+        │ └─────────────────┘ │        ┌────────────▼─────────────┐
+        └──────────────┬──────┘        │         Redis 7          │
+                       │               │  • Stock Read Cache      │
+                       └──────────────►│  • SKU Contention Rates  │
+                                       └────────────┬─────────────┘
+                                                    │
+        ┌───────────────────────────────────────────┼────────────────────────────────────────┐
+        │                                           │                                        │
+┌───────▼─────────────┐                   ┌─────────▼───────────┐                  ┌─────────▼──────────────┐
+│    Outbox Relay     │                   │    Reaper Daemon    │                  │  Logistics Consumer    │
+│  (500ms poll,       │                   │  (1s poll,          │                  │  (3PL carrier dispatch,│
+│   SKIP LOCKED,      │                   │   SKIP LOCKED,      │                  │   consumer group,      │
+│   batch 100)        │                   │   auto-rollback)    │                  │   in-memory dedup)     │
+└───────┬─────────────┘                   └─────────────────────┘                  └────────────────────────┘
+        │
+        ▼
+┌─────────────────────┐                   ┌─────────────────────┐                  ┌────────────────────────┐
+│  Redpanda / Kafka   │                   │  Prometheus v2.54   │                  │      Grafana 11.2      │
+│  Topic:             │                   │  Scrapes :8080/     │                  │  Pre-built Dashboard:  │
+│  orders.events      │                   │  metrics every 1s   │─────────────────►│  Throughput, Latency,  │
+└─────────────────────┘                   └─────────────────────┘                  │  Slots, Worker Rates   │
+                                                                                   └────────────────────────┘
 ```
 
 ---
@@ -109,116 +124,88 @@ It handles the full order lifecycle:
 
 ### 1. Adaptive Concurrency Strategy (Strategy Pattern)
 
-The system implements **three distinct reservation strategies** behind a common `ReservationStrategy` interface and dynamically selects the optimal one at runtime:
+The engine implements **three distinct database locking strategies** behind a unified `ReservationStrategy` interface and dynamically switches between them at runtime:
 
-| Strategy | Mechanism | Best For |
+| Strategy | Implementation Details | Contention Sweet Spot |
 |---|---|---|
-| **Pessimistic** | `SELECT ... FOR UPDATE` — acquires an exclusive row lock before reading | High contention (flash sales, hot SKUs) |
-| **Optimistic** | CAS with version column — read, then `UPDATE ... WHERE version = ?` with exponential backoff + jitter | Low-to-moderate contention |
-| **Atomic Conditional** | Single `UPDATE ... WHERE available_qty >= ?` — no separate read | Single-item fast path |
+| **Pessimistic** | `SELECT ... FOR UPDATE` acquires an exclusive row lock prior to reading available inventory. | **High Contention** (flash sales, hot SKUs). Completely prevents CAS retry storms. |
+| **Optimistic** | Read-then-CAS using a monotonic `version` counter: `UPDATE ... WHERE version = ?`. If a version collision occurs, it retries with exponential backoff plus full randomized jitter (`5ms * 2^attempt + rand(0-10ms)`). | **Low to Moderate Contention**. Zero lock wait overhead for non-overlapping inventory baskets. |
+| **Atomic Conditional** | Single-statement execution: `UPDATE ... WHERE available_qty >= N`. Eliminates separate read round-trips. | **Single-Item Fast Path**. Highest throughput under high-velocity single-item purchases. |
 
-The `AdaptiveStrategy` orchestrates selection:
-- **Context override**: Callers can force a specific strategy via `context.Value`
-- **Single-item optimization**: Automatically routes 1-item orders to the zero-round-trip Atomic strategy
-- **Contention detection**: Uses Redis sliding-window counters (`INCR` + `EXPIRE 1s`) per SKU — when the request rate for a SKU exceeds the threshold (10 req/s), it escalates to Pessimistic locking to avoid retry storms
-
-**Why this matters**: Optimistic locking is faster under low contention but degrades under high contention due to retry storms. Pessimistic locking is safe but serializes all requests. The adaptive layer gives you the best of both worlds — and our benchmarks prove each strategy independently enforces zero oversell.
+The `AdaptiveStrategy` coordinates automated selection:
+- **Fast Path Selection**: Single-item orders are routed directly to the zero-lock Atomic strategy.
+- **Dynamic Contention Detection**: Tracks request frequencies per SKU in Redis using sliding-window counters (`INCR` + `EXPIRE 1s`). When request velocity for a SKU hits the contention threshold ($\ge 10\text{ req/s}$), it immediately escalates multi-item orders to Pessimistic locking.
+- **Context Overrides**: Specific locking strategies can be pinned on demand via `context.WithValue(ctx, StrategyOverrideKey, "pessimistic")`.
 
 ### 2. Transactional Outbox Pattern
 
-Event publishing to Kafka uses the **Transactional Outbox** — a pattern that guarantees exactly-once delivery semantics without distributed transactions:
+To avoid dual-write distributed transaction failures between PostgreSQL and Kafka, domain events are written to an `outbox` table within the **same database transaction** as the inventory state mutation:
 
-```
-                 ┌── Single ACID Transaction ──┐
-                 │                              │
-Reserve/Confirm ─┤  UPDATE inventory            │
-                 │  INSERT INTO orders          │
-                 │  INSERT INTO outbox ◄────────┤── Event written atomically
-                 │                              │
-                 └──────────────────────────────┘
-                             │
-                   ┌─────────▼──────────┐
-                   │   Outbox Relay     │
-                   │ (background poll)  │
-                   │  SELECT ... FOR    │
-                   │  UPDATE SKIP LOCKED│
-                   │  → Kafka publish   │
-                   │  → Mark PUBLISHED  │
-                   └────────────────────┘
-```
-
-**Implementation details**:
-- **Batched processing**: Fetches up to 100 pending events per cycle, bounded to 50 batches per tick for back-pressure
-- **Stale lease reclamation**: If a relay worker crashes mid-publish, rows locked by `PROCESSING` status for >30 seconds are automatically reclaimed
-- **Retry with circuit breaker**: Failed publishes increment an `attempts` counter; after 5 failures the event is moved to `FAILED` status for manual inspection
-- **Event types**: `OrderFulfilled`, `OrderCancelled`, `OrderExpired` — each with structured JSON payloads and Kafka headers for consumer routing
+- **Transactional Atomicity**: Stock reservation/confirmation and the event insert succeed or roll back together.
+- **Lock-Free Concurrency**: The background relay fetches batches using `SELECT ... FOR UPDATE SKIP LOCKED`. Multiple relay instances partition the outbox table cleanly without blocking each other.
+- **Stale Lease Recovery**: If an outbox worker crashes mid-publish, rows stuck in `PROCESSING` status for $>30\text{s}$ are safely reclaimed back to `PENDING`.
+- **Circuit Breaker / Dead Letter**: Failing publishes increment an `attempts` counter. After 5 retries, status becomes `FAILED` to prevent poison pills from blocking the pipeline.
 
 ### 3. Geo-Aware Warehouse Routing
 
-Orders are routed to the optimal warehouse(s) using a **weighted cost function** that balances proximity and stock depth:
+Orders are allocated across warehouse nodes using a **weighted cost function** that balances transit proximity and network stock preservation:
 
-```
-cost = 0.7 × (distance / max_distance) + 0.3 × (1 − stock_ratio)
-```
+$$\text{cost} = 0.7 \times \left(\frac{\text{distance}}{\text{max\_distance}}\right) + 0.3 \times (1.0 - \text{stock\_ratio})$$
 
-- **Distance**: Calculated via the Haversine formula (great-circle distance on Earth's surface)
-- **Stock ratio**: Proportion of a warehouse's available stock relative to total network stock
-- **Multi-warehouse split-fill**: If no single warehouse has enough stock, the order is split across warehouses in cost-sorted order — the closest/most-stocked warehouse fills first, the remainder cascades
-
-**Why 0.7 / 0.3 weighting?** Shipping costs dominate fulfillment economics. A warehouse 50 km away with 20 units is almost always better than one 500 km away with 200 units. The 30% stock-depth factor prevents draining a single warehouse to zero while a neighboring one sits full.
+- **Distance**: Computed via spherical geometry with the Haversine formula on Earth's radius ($R = 6,371\text{ km}$).
+- **Stock Ratio**: Ratio of warehouse available quantity over total network available quantity.
+- **Multi-Warehouse Split Fill**: When no single warehouse holds sufficient inventory, the allocator sorts candidates by cost ascending and splits the order across the closest adequately-stocked nodes.
 
 ### 4. Reservation Reaper (Zombie Stock Reclamation)
 
-Abandoned checkouts are a silent killer for inventory systems. A customer adds 5 units to cart, the system reserves them, and the customer walks away — those 5 units are stuck in limbo.
+Abandoned checkouts lock inventory away from paying customers. The **Reaper** daemon runs as an autonomous background worker:
 
-The **Reaper** is a background daemon that:
-- Polls every 1 second for `RESERVED` orders whose `expires_at` has passed
-- Uses `SELECT ... FOR UPDATE SKIP LOCKED` so multiple reaper instances don't contend on the same rows
-- Rolls back inventory atomically: `available_qty += reserved, reserved_qty -= reserved`
-- Writes `ROLLBACK` entries to the audit log
-- Transitions the order to `EXPIRED` status
-
-**SLA guarantee**: Tests verify that expired reservations are reclaimed within 3 seconds (well under the 5-second SLA target).
+- Scans for orders with `status = 'RESERVED'` and `expires_at < NOW()` on a 1-second interval using `FOR UPDATE SKIP LOCKED`.
+- Restores stock atomically: `available_qty += quantity, reserved_qty -= quantity`.
+- Writes immutable `ROLLBACK` audit records.
+- Transitions order status to `EXPIRED`.
+- **SLA Guarantee**: Verified in automated testing and k6 chaos tests to reclaim abandoned stock within 3 seconds (well below the 5-second SLA target).
 
 ### 5. Idempotency Middleware
 
-The reservation endpoint is protected by **database-backed idempotency** that prevents duplicate orders from network retries, double-clicks, or frontend bugs:
+Prevents duplicate orders caused by client retries, network blips, or double submissions:
 
-1. Client sends `Idempotency-Key` header with each request
-2. Middleware computes SHA-256 hash of the request body
-3. If the key exists with a different hash → `422 Unprocessable Entity` (payload mismatch)
-4. If the key exists with state `IN_PROGRESS` → `409 Conflict` (concurrent processing)
-5. If the key exists with state `COMPLETED` → replays the cached response with `X-Idempotent-Replay: true`
-6. If new → inserts the key, delegates to the handler, captures the response via a `responseRecorder`, and marks the key `COMPLETED` with the cached response
-
-This ensures **exactly-once semantics at the API level** — even if a client retries the same request 10 times, exactly one order is created.
+1. Requires an `Idempotency-Key` header on mutating endpoints.
+2. Generates a SHA-256 checksum of the request body payload.
+3. If key exists with different payload $\to$ rejects with `422 Unprocessable Entity`.
+4. If key exists with state `IN_PROGRESS` $\to$ rejects with `409 Conflict`.
+5. If key exists with state `COMPLETED` $\to$ immediately returns stored status and JSON body with `X-Idempotent-Replay: true`.
+6. New requests are registered in an `IN_PROGRESS` state, executed through a `responseRecorder`, and committed with the status and payload in a 5-second bounded completion context.
 
 ### 6. Semaphore-Based Load Shedding
 
-The server enforces a **bounded concurrency limit** of 100 in-flight requests using a channel-based semaphore middleware:
+Prevents database pool exhaustion under extreme traffic surges:
 
 ```go
 select {
-case sem <- struct{}{}:    // Acquired slot → process request
-case <-time.After(wait):   // Timeout → 503 + Retry-After header
-case <-r.Context().Done(): // Client disconnected → early return
+case sem <- struct{}{}:    // Slot acquired: increments metrics.SemaphoreActiveSlots
+    defer func() { <-sem; metrics.SemaphoreActiveSlots.Dec() }()
+    next.ServeHTTP(w, r)
+case <-time.After(wait):   // Timed out waiting for slot (100ms)
+    metrics.SemaphoreRejectionsTotal.Inc()
+    w.Header().Set("Retry-After", "1")
+    w.WriteHeader(http.StatusServiceUnavailable) // 503
+case <-r.Context().Done(): // Client disconnected
+    return
 }
 ```
 
-**Why not just use timeouts?** A 60-second request timeout allows 6,000 in-flight requests at 100 RPS. The semaphore caps it at 100, shedding excess load immediately with `503 Service Unavailable` and a `Retry-After` header — allowing load balancers and clients to back off gracefully.
+- Bounded capacity: 100 concurrent in-flight requests.
+- Max queue wait: 100ms. Overflows immediately receive `503 Service Unavailable` with `Retry-After: 1`.
 
 ### 7. Redis Read-Through Cache with Write Invalidation
 
-Stock queries use a **cache-aside** pattern:
-
-- **Read path**: Check Redis → on HIT, return immediately with `X-Cache: HIT` header. On MISS, query PostgreSQL, cache the result for 5 seconds, return with `X-Cache: MISS`
-- **Write path**: After every restock, the cache key for that SKU is immediately invalidated (`DEL inventory:<sku>`)
-
-The 5-second TTL is deliberately short — in a high-velocity inventory system, stale reads can mislead customers. The TTL absorbs read spikes while the invalidation-on-write ensures restocks are immediately visible.
+- **Read Path**: `GET /api/v1/inventory/{sku}` checks Redis first. On hit, writes cached JSON directly to the wire with `X-Cache: HIT`. On miss, queries PostgreSQL, marshals response, caches with a 5-second TTL, and returns `X-Cache: MISS`.
+- **Write Path**: Restock operations (`POST /api/v1/inventory/restock`) invalidate the cache immediately upon transaction commit (`DEL inventory:<sku>`).
 
 ### 8. Deadlock-Immune Row Ordering
 
-Every multi-row transaction in the system — reservation, confirmation, cancellation, and reaper rollback — sorts rows by `(warehouse_id, sku)` before acquiring locks:
+To eliminate database deadlocks during multi-item, cross-warehouse transactions, every transactional mutation sorts all items by `(warehouse_id ASC, sku ASC)` prior to acquiring locks:
 
 ```go
 sort.Slice(items, func(i, j int) bool {
@@ -230,181 +217,245 @@ sort.Slice(items, func(i, j int) bool {
 })
 ```
 
-This deterministic lock ordering **eliminates deadlocks entirely** — no matter which goroutine acquires locks first, they always acquire them in the same global order. This is a textbook technique, but it's consistently applied across every transactional code path.
+Applied consistently across:
+- `ReserveOrder`
+- `ConfirmOrder`
+- `CancelOrder`
+- `ReapExpiredOrders`
 
-### 9. Defensive Data Integrity
+### 9. Defensive Multi-Layer Data Integrity
 
-The system enforces inventory correctness at **three independent layers**:
+The system guarantees inventory correctness through three decoupled layers of defense:
 
-| Layer | Mechanism | What it prevents |
-|---|---|---|
-| **Application** | Strategy pre-checks (`available_qty < requested` → reject) | Logical oversell |
-| **SQL** | `UPDATE ... WHERE available_qty >= $3` (atomic strategy) | Race-condition oversell |
-| **Database** | `CHECK (available_qty >= 0)` constraint on `inventory_items` | Any path to negative stock |
+```
+[Layer 1: Application Logic]
+  • Abort-before-lock checks
+  • Pre-condition checks: available_qty < req.Quantity → return ErrInsufficientStock
+              │
+              ▼
+[Layer 2: SQL Conditional Updates]
+  • UPDATE inventory_items SET ... WHERE warehouse_id = $1 AND sku = $2 AND available_qty >= $3
+  • Zero rows updated if stock was depleted concurrently
+              │
+              ▼
+[Layer 3: Database Engine Constraint]
+  • CONSTRAINT chk_available_non_negative CHECK (available_qty >= 0)
+  • CONSTRAINT chk_reserved_non_negative CHECK (reserved_qty >= 0)
+  • Enforced by PostgreSQL kernel with SQLSTATE 23514 (check_violation)
+```
 
-If the application logic has a bug, the SQL WHERE clause catches it. If the SQL has a bug, the PostgreSQL CHECK constraint is the final safety net. **No single failure can produce negative inventory.**
+### 10. Real-Time Observability & Profiling (Prometheus + Grafana + pprof)
+
+The engine includes built-in observability with zero external agent dependencies:
+
+#### Prometheus Metrics Vector (`/metrics`)
+- `warego_reservation_duration_seconds`: Histogram measuring end-to-end reservation transaction latency partitioned by `strategy` (`adaptive`, `pessimistic`, `optimistic`, `atomic`) and `status` (`success`, `out_of_stock`, `error`).
+- `warego_reservations_total`: Counter tracking total attempts by strategy and outcome.
+- `warego_semaphore_active_slots`: Gauge reporting active in-flight requests (0–100).
+- `warego_semaphore_rejections_total`: Counter tracking shed requests (503).
+- `warego_reaper_reclaimed_total`: Counter tracking zombie orders reclaimed by the daemon.
+- `warego_reaper_cycle_duration_seconds`: Histogram tracking reaper execution time.
+- `warego_outbox_events_total`: Counter partitioned by `status` (`published`, `failed`) and `event_type`.
+
+#### Pre-Provisioned Grafana Dashboard (`http://localhost:3000`)
+- **Reservation Throughput (RPS)**: Real-time traffic broken down by outcome status.
+- **Active Semaphore Slots**: Visual gauge (0–100) with green/yellow/red saturation thresholds.
+- **Strategy Breakdown (RPS)**: Live distribution of traffic handled by each locking strategy.
+- **Latency Percentiles (p50 / p95 / p99)**: Sub-second SLA tracking across all transactions.
+- **Background Workers Activity**: Real-time reaper reclamation and Kafka outbox dispatch rates.
+
+#### Live Go Runtime Profiling (`/debug/pprof/`)
+Mounted directly via Chi middleware profiler for diagnosing locks, memory allocation, and CPU bottlenecks under high concurrency:
+- `/debug/pprof/goroutine` — inspect active goroutines and lock waits
+- `/debug/pprof/profile` — CPU profiling under load
+- `/debug/pprof/heap` — memory allocations
+- `/debug/pprof/mutex` — lock contention analysis
 
 ---
 
 ## Scalability & Performance
 
-| Dimension | Implementation |
+| Parameter | Configuration & Implementation |
 |---|---|
-| **Connection pooling** | `pgxpool` with 25 max / 5 min connections, 5-minute idle timeout |
-| **Concurrent request limit** | Semaphore middleware caps at 100 in-flight; excess gets `503 + Retry-After` |
-| **Batch processing** | Outbox relay and reaper both process up to 100 rows per batch, 50 batches per tick |
-| **Lock-free polling** | `FOR UPDATE SKIP LOCKED` on outbox and expired-order queries — multiple workers won't block each other |
-| **Horizontal scaling** | Workers (reaper, outbox relay) use `SKIP LOCKED` — safe to run N replicas concurrently |
-| **Partial-index scans** | `idx_inventory_sku_avail` filters `available_qty > 0`; `idx_orders_expired` filters `status = 'RESERVED'` |
-| **Short-lived cache** | 5-second Redis TTL absorbs read spikes without serving dangerously stale data |
-| **Graceful shutdown** | SIGINT/SIGTERM triggers context cancellation → in-flight requests drain → 5-second shutdown deadline |
-| **HTTP tuning** | `ReadTimeout: 5s`, `WriteTimeout: 10s`, `IdleTimeout: 120s` — balanced for throughput and resource reclamation |
+| **Database Pool** | `pgxpool` configured with `MinConns = 5`, `MaxConns = 25`, `MaxConnIdleTime = 5m`. |
+| **Admission Control** | Channel semaphore caps in-flight operations at 100 with a 100ms queue wait before load shedding. |
+| **Worker Scaling** | Both Reaper and Outbox Relay use `FOR UPDATE SKIP LOCKED`, allowing horizontal scaling across N worker nodes without lock conflicts. |
+| **Batch Drainage** | Reaper and Outbox Relay execute up to 50 batches (100 rows/batch) per tick to clear traffic spikes smoothly. |
+| **Partial Indexes** | `idx_inventory_sku_avail` indexes only `available_qty > 0`. `idx_orders_expired` indexes only `status = 'RESERVED'`. |
+| **Memory Bound** | `http.MaxBytesReader` caps all incoming JSON request bodies at 1MB to protect against payload memory exhaustion. |
+| **Connection Timeouts** | `ReadTimeout: 5s`, `WriteTimeout: 10s`, `IdleTimeout: 120s`. |
 
 ---
 
 ## Database Schema Design
 
 ```
-┌──────────────┐     ┌──────────────┐     ┌─────────────────┐
-│  warehouses  │     │   products   │     │  inventory_items │
-│──────────────│     │──────────────│     │─────────────────│
-│ id (UUID PK) │◄────│ sku (PK)     │◄────│ warehouse_id FK │
-│ code (UNIQ)  │     │ name         │     │ sku FK          │
-│ latitude     │     │ weight_grams │     │ available_qty   │
-│ longitude    │     └──────────────┘     │ reserved_qty    │
-│ is_active    │                          │ version         │
-└──────────────┘                          │ CHECK(avail>=0) │
-                                          │ CHECK(resrv>=0) │
-       ┌──────────────────────────────────│ UNIQUE(wh,sku)  │
-       │                                  └─────────────────┘
-       │
-┌──────▼───────┐     ┌──────────────┐     ┌─────────────────┐
-│    orders    │     │ order_items   │     │ inventory_audit  │
-│──────────────│     │──────────────│     │     _log         │
-│ id (UUID PK) │◄────│ order_id FK  │     │─────────────────│
-│ idempotency  │     │ warehouse_id │     │ warehouse_id FK │
-│   _key (UNIQ)│     │ sku FK       │     │ sku FK          │
-│ customer_id  │     │ quantity     │     │ order_id FK     │
-│ status (ENUM)│     └──────────────┘     │ event_type      │
-│ dest_lat/lon │                          │ delta_available  │
-│ expires_at   │     ┌──────────────┐     │ delta_reserved   │
-│ version      │     │    outbox     │     └─────────────────┘
-└──────────────┘     │──────────────│
-                     │ aggregate_type│     ┌─────────────────┐
-                     │ aggregate_id  │     │ idempotency_key │
-                     │ event_type   │     │─────────────────│
-                     │ payload JSONB│     │ key (PK)        │
-                     │ status (ENUM)│     │ request_hash    │
-                     │ attempts     │     │ state           │
-                     │ locked_at/by │     │ response_status │
-                     └──────────────┘     │ response_body   │
-                                          └─────────────────┘
+┌──────────────────┐       ┌──────────────────┐       ┌────────────────────────┐
+│    warehouses    │       │     products     │       │    inventory_items     │
+│──────────────────│       │──────────────────│       │────────────────────────│
+│ id (UUID PK)     │◄──────│ sku (VARCHAR PK) │◄──────│ warehouse_id (UUID FK) │
+│ code (UNIQUE)    │       │ name             │       │ sku (VARCHAR FK)       │
+│ latitude         │       │ unit_weight_grams│       │ available_qty (INT)    │
+│ longitude        │       └──────────────────┘       │ reserved_qty (INT)     │
+│ is_active        │                                  │ version (BIGINT)       │
+└──────────────────┘                                  │ CHECK (avail >= 0)     │
+         ▲                                            │ CHECK (resrv >= 0)     │
+         │                                            │ UNIQUE (wh_id, sku)    │
+         │                                            └────────────────────────┘
+         │
+┌────────┴─────────┐       ┌──────────────────┐       ┌────────────────────────┐
+│      orders      │       │   order_items    │       │   inventory_audit_log  │
+│──────────────────│       │──────────────────│       │────────────────────────│
+│ id (UUID PK)     │◄──────│ order_id (FK)    │       │ id (BIGSERIAL PK)      │
+│ idempotency_key  │       │ warehouse_id (FK)│       │ warehouse_id (UUID FK) │
+│ customer_id      │       │ sku (VARCHAR FK) │       │ sku (VARCHAR FK)       │
+│ status (ENUM)    │       │ quantity (INT)   │       │ order_id (UUID FK)     │
+│ dest_lat/lon     │       └──────────────────┘       │ event_type (VARCHAR)   │
+│ expires_at (TZ)  │                                  │ delta_available (INT)  │
+│ created/updated  │                                  │ delta_reserved (INT)   │
+└──────────────────┘                                  │ created_at (TIMESTAMPTZ│
+                                                      └────────────────────────┘
+┌──────────────────┐       ┌──────────────────┐
+│      outbox      │       │ idempotency_key  │
+│──────────────────│       │──────────────────│
+│ id (UUID PK)     │       │ key (VARCHAR PK) │
+│ aggregate_type   │       │ request_hash     │
+│ aggregate_id     │       │ state (ENUM)     │
+│ event_type       │       │ response_status  │
+│ payload (JSONB)  │       │ response_body    │
+│ status (ENUM)    │       │ created_at       │
+│ attempts (INT)   │       │ completed_at     │
+│ locked_at/by     │       └──────────────────┘
+└──────────────────┘
 ```
-
-**Key schema decisions**:
-- **Separate `available_qty` and `reserved_qty`** — allows the system to distinguish between "in stock but held" and "actually available", critical for accurate customer-facing counts
-- **`version` column on inventory** — enables optimistic concurrency control without requiring row-level locks
-- **`idempotency_key` on orders** — prevents duplicate order creation at the database level (UNIQUE constraint)
-- **Partial indexes** — `idx_inventory_sku_avail WHERE available_qty > 0` skips empty warehouse rows; `idx_orders_expired WHERE status = 'RESERVED'` makes reaper scans efficient
-- **`ON DELETE RESTRICT` on inventory FKs** — prevents accidental warehouse or product deletion while inventory exists
-- **Order status as ENUM** — `RESERVED → CONFIRMED | CANCELLED | EXPIRED` — enforced by application-level state machine
 
 ---
 
-## Testing Strategy
+## Testing & Verification Suite
 
-The project has **4 test tiers** covering correctness, concurrency safety, and performance:
+### Unit & Integration Tests (Go)
 
-### Unit Tests
-| Test | What it proves |
-|---|---|
-| `TestHaversineKm` | Haversine distance calculation: identical points → 0 km, Delhi→Jaipur ≈ 238 km ± 10 km |
-| `TestSemaphore_PassThrough` | Normal requests pass through the semaphore |
-| `TestSemaphore_QueueWaitSuccess` | Blocked requests acquire released slots |
-| `TestSemaphore_TimeoutRejection` | Excess requests get `503` with `Retry-After` header |
-| `TestSemaphore_ContextCancellation` | Client disconnection triggers early return (no leaked goroutines) |
+The native Go test suite verifies business logic, database constraints, and concurrency guarantees:
 
-### Integration Tests (require running Docker infrastructure)
-| Test | What it proves |
-|---|---|
-| `TestInventoryConstraints` | Restock works; PostgreSQL `CHECK` constraint rejects negative stock (SQLSTATE 23514) |
-| `TestConcurrentReservationZeroOversell` | **1,000 goroutines** race for **100 units** → exactly 100 succeed, 900 rejected, `available_qty = 0` |
-| `TestOrderLifecycle_Confirm` | Reserve → Confirm: stock moves from `reserved` to committed, order status = `CONFIRMED` |
-| `TestOrderLifecycle_Cancel` | Reserve → Cancel: stock fully restored, order status = `CANCELLED` |
-| `TestOrderLifecycle_StateTransitions` | Confirming a `CONFIRMED` order fails; cancelling a `CONFIRMED` order fails (state machine enforcement) |
+```bash
+# Unit tests
+go test -v ./pkg/geo/...
+go test -v ./internal/api/middleware/...
 
-### Outbox & Relay Tests
-| Test | What it proves |
-|---|---|
-| `TestOutboxRelay_PublishPendingEvents` | Confirm → outbox event → relay publishes to mock Kafka → event marked `PUBLISHED` |
-| `TestOutboxRelay_RetryOnFailure` | Kafka failure → `attempts` incremented, event stays `PENDING` for retry |
-| `TestOutboxRelay_ReclaimStaleLeases` | Stale `PROCESSING` rows (locked >30s) are reclaimed back to `PENDING` |
+# Integration tests (requires Docker services)
+go test -v ./test/integration/...
 
-### Reaper & SLA Tests
-| Test | What it proves |
-|---|---|
-| `TestReaper_ReclaimExpiredOrder` | Expired reservation → stock restored, order = `EXPIRED` |
-| `TestReaper_SkipActiveReservations` | Active (non-expired) reservations are left untouched |
-| `TestReaper_SLA_Within5Seconds` | Live reaper daemon reclaims expired stock within 3 seconds (SLA < 5s) |
+# Race condition detection
+go test -race ./...
 
-### Benchmark Tests
-| Benchmark | What it measures |
-|---|---|
-| `TestStrategyComparison` | All three strategies independently enforce zero-oversell: 200 goroutines, 50 units — exactly 50 succeed per strategy |
-| `BenchmarkStrategies` | Parallel throughput (ops/sec) for each strategy under sustained load using `b.RunParallel` |
+# Concurrency & throughput benchmarks
+go test -bench=. -benchmem ./test/integration/...
+```
+
+#### Test Coverage Summary
+- `TestInventoryConstraints`: Verifies restock logic and verifies that PostgreSQL rejects negative stock with SQLSTATE `23514`.
+- `TestConcurrentReservationZeroOversell`: **1,000 goroutines** race for 100 available units. Asserts exactly 100 successes, 900 rejections, `available_qty = 0`, and `reserved_qty = 100`.
+- `TestOrderLifecycle_Confirm`: Full Reserve $\to$ Confirm lifecycle. Asserts reserved quantity commits to 0 and order status reaches `CONFIRMED`.
+- `TestOrderLifecycle_Cancel`: Full Reserve $\to$ Cancel lifecycle. Asserts full restoration of available stock and status `CANCELLED`.
+- `TestOrderLifecycle_StateTransitions`: Confirms that invalid state transitions (e.g. double confirmation or cancelling confirmed orders) are strictly rejected.
+- `TestOutboxRelay_PublishPendingEvents`: Verifies transactional outbox event creation, Kafka writer dispatch, and transition to `PUBLISHED`.
+- `TestOutboxRelay_RetryOnFailure`: Simulates broker network timeouts, verifying retry counter increments without data loss.
+- `TestOutboxRelay_ReclaimStaleLeases`: Verifies that events locked by crashed workers are reclaimed.
+- `TestReaper_ReclaimExpiredOrder`: Tests automatic stock restoration when order TTL expires.
+- `TestReaper_SLA_Within5Seconds`: Live daemon test verifying expired reservations are restored within 3 seconds.
+
+---
+
+### Automated k6 Load & Chaos Suite
+
+Located in `test/k6/`, these automated scenarios simulate realistic production flash sales, deadlocks, and broker failures:
+
+```bash
+# 1. Zero Oversell Flash Sale Spike (500 VUs, 2,000 iterations against 100 units)
+k6 run test/k6/s1_zero_oversell.js
+
+# 2. Zombie Stock Reclamation SLA (< 5s target)
+k6 run test/k6/s2_zombie_stock.js
+
+# 3. Cross-Warehouse Deadlock Immunity Stress Test (200 VUs, 1,000 orders)
+k6 run test/k6/s3_deadlock.js
+
+# 4. Sustained Throughput & Latency (500 RPS constant rate for 20s)
+k6 run test/k6/s4_latency.js
+
+# 5. Outbox Event Streaming Pipeline Verification
+k6 run test/k6/s5_outbox_chaos.js
+
+# 6. High vs Low Contention Locking Strategy Benchmark
+k6 run test/k6/s6_strategy_benchmark.js
+```
+
+| Scenario | Objective & Workload | Success Criteria / Thresholds |
+|---|---|---|
+| **S1: Zero Oversell** | 500 VUs generate 2,000 requests racing for 100 units of a hot flash-sale SKU. | `successful_reservations == 100`, zero oversell. |
+| **S2: Zombie Stock** | 10 VUs create 50 abandoned orders with 1-second TTL. Background reaper reclaims stock. | `p(95) reclaim latency < 5000ms`. |
+| **S3: Deadlock Immunity** | 200 VUs place 1,000 orders locking items across 2 warehouses in reverse orders (WH1+WH2 vs WH2+WH1). | `deadlock_errors == 0`. |
+| **S4: Latency & Throughput** | Constant arrival rate of 500 RPS sustained over 20s (up to 300 VUs). | `http_req_duration p(95) < 1000ms`. |
+| **S5: Outbox Pipeline** | End-to-end Reserve $\to$ Confirm lifecycle streaming events to Redpanda. | 100% events delivered to broker. |
+| **S6: Strategy Benchmark** | Compares hot SKU contention (50 VUs) against catalog distribution (50 VUs). | Validates automated strategy escalation. |
 
 ---
 
 ## API Reference
 
-All endpoints are prefixed with `/api/v1`.
+All application endpoints are served under `/api/v1` (with system endpoints at root):
+
+### System & Telemetry
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/healthz` | Deep health check (verifies PostgreSQL and Redis connectivity). |
+| `GET` | `/metrics` | Prometheus metrics scrape endpoint. |
+| `GET` | `/debug/pprof/*` | Go runtime profiling index (goroutine, heap, cpu, mutex). |
 
 ### Warehouses
 | Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/warehouses` | Create a warehouse with geo-coordinates |
-| `GET` | `/warehouses` | List all active warehouses |
+| `POST` | `/api/v1/warehouses` | Register a new warehouse with geographic coordinates. |
+| `GET` | `/api/v1/warehouses` | List all active warehouse facilities. |
 
 ### Products
 | Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/products` | Register a new product (SKU, name, weight) |
-| `GET` | `/products` | List all products |
-| `GET` | `/products/{sku}` | Get product by SKU |
+| `POST` | `/api/v1/products` | Create a catalog SKU with name and unit weight. |
+| `GET` | `/api/v1/products` | List all catalog products. |
+| `GET` | `/api/v1/products/{sku}` | Retrieve product details by SKU. |
 
 ### Inventory
 | Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/inventory/restock` | Add stock to a warehouse (ACID tx + audit log + cache invalidation) |
-| `GET` | `/inventory/{sku}` | Get aggregated stock across all warehouses (`X-Cache: HIT\|MISS`) |
+| `POST` | `/api/v1/inventory/restock` | Restock SKU inventory in a warehouse (ACID tx + audit log + cache invalidation). |
+| `GET` | `/api/v1/inventory/{sku}` | Query stock summary across all warehouses (`X-Cache: HIT` / `MISS`). |
 
-### Orders
-| Method | Endpoint | Description | Headers |
+### Orders & Reservations
+| Method | Endpoint | Description | Headers & Parameters |
 |---|---|---|---|
-| `POST` | `/orders/reserve` | Reserve inventory across optimal warehouses | `Idempotency-Key` (required) |
-| `GET` | `/orders/{id}` | Get order details with line items | |
-| `POST` | `/orders/{id}/confirm` | Confirm order → commit stock, publish `OrderFulfilled` event | |
-| `POST` | `/orders/{id}/cancel` | Cancel order → rollback stock, publish `OrderCancelled` event | |
-
-### System
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/healthz` | Deep health check (pings both PostgreSQL and Redis) |
+| `POST` | `/api/v1/orders/reserve` | Reserve multi-item order across optimal warehouses. | Header: `Idempotency-Key` (required)<br>Payload: `{"dest_latitude":..., "dest_longitude":..., "items":[...], "ttl_seconds": 600}` |
+| `GET` | `/api/v1/orders/{id}` | Fetch order details along with assigned warehouse line items. | Path: `id` (UUID) |
+| `POST` | `/api/v1/orders/{id}/confirm` | Confirm order: commits reserved inventory, generates `OrderFulfilled` outbox event. | Path: `id` (UUID) |
+| `POST` | `/api/v1/orders/{id}/cancel` | Cancel order: rolls back reserved inventory, generates `OrderCancelled` outbox event. | Path: `id` (UUID) |
 
 ---
 
 ## Tech Stack
 
-| Component | Technology | Role |
-|---|---|---|
-| **Language** | Go 1.27 | Application server, worker daemons |
-| **Database** | PostgreSQL 16 (Alpine) | Source of truth — inventory, orders, outbox, audit log |
-| **Cache** | Redis 7 (Alpine) | Read-through cache, contention rate tracking |
-| **Message Broker** | Redpanda (Kafka-compatible) | Event streaming for downstream consumers |
-| **Router** | chi v5 | HTTP routing with middleware chain |
-| **DB Driver** | pgx v5 + pgxpool | High-performance PostgreSQL driver with connection pooling |
-| **Code Gen** | sqlc | Type-safe Go from raw SQL queries — no ORM |
-| **Containerization** | Docker Compose | Local infrastructure orchestration |
+| Component | Technology | Version | Rationale |
+|---|---|---|---|
+| **Language** | Go | 1.27 | Native concurrency primitives (goroutines, channels), low runtime overhead, predictable garbage collection. |
+| **HTTP Router** | chi | v5.5.0 | Lightweight, idiomatic router with zero allocation overhead and composable middleware. |
+| **Database** | PostgreSQL | 16-alpine | Row-level locking (`FOR UPDATE SKIP LOCKED`), strict ACID guarantees, and JSONB support. |
+| **Database Driver** | pgx / pgxpool | v5.12.0 | High-performance native PostgreSQL wire protocol driver with optimized connection pooling. |
+| **Query Generator** | sqlc | v1.31.1 | Compiles raw SQL queries into type-safe, boilerplate-free Go code with zero runtime reflection. |
+| **Cache & Counters** | Redis | 7-alpine | In-memory key-value store for stock read caching and sliding-window contention rate limiting. |
+| **Message Broker** | Redpanda (Kafka) | v24.1.8 | High-throughput distributed log for reliable downstream event streaming. |
+| **Kafka Client** | kafka-go | v0.4.51 | Native Go client supporting least-bytes partition balancing and consumer groups. |
+| **Metrics** | Prometheus | v2.54.1 | Time-series metrics engine scraping latency histograms and counters. |
+| **Dashboards** | Grafana | 11.2.0 | Real-time telemetry dashboard pre-configured via automated file provisioning. |
+| **Load Testing** | k6 | Latest | Developer-centric load generator for high-VU concurrency, deadlock, and chaos simulations. |
 
 ---
 
@@ -414,134 +465,194 @@ All endpoints are prefixed with `/api/v1`.
 Ware_Go/
 ├── cmd/
 │   └── server/
-│       └── main.go                          # Entrypoint: pool setup, worker launch, HTTP server, graceful shutdown
+│       └── main.go                         # Server bootstrap: pools, Kafka, background daemons, graceful shutdown
+├── deploy/
+│   ├── grafana/
+│   │   ├── dashboards/
+│   │   │   └── ware_go_dashboard.json      # Pre-built Grafana performance & concurrency dashboard
+│   │   └── provisioning/
+│   │       ├── dashboards/dashboards.yml   # Automatic dashboard provisioning
+│   │       └── datasources/prometheus.yml  # Prometheus data source configuration
+│   └── prometheus/
+│       └── prometheus.yml                  # Prometheus scrape config targeting host:8080/metrics
 ├── internal/
 │   ├── api/
-│   │   ├── router.go                        # Route registration and dependency wiring
-│   │   ├── inventory.go                     # Restock (ACID tx) + GetStock (cache-aside)
-│   │   ├── orders.go                        # Reserve / Confirm / Cancel / Get
-│   │   ├── products.go                      # CRUD for product catalog
-│   │   ├── warehouses.go                    # CRUD for warehouses
-│   │   ├── response.go                      # Unified JSON response helpers + MaxBytesReader
+│   │   ├── router.go                       # Route registration & handler injection
+│   │   ├── inventory.go                    # Restock (ACID tx) & stock summary (cache-aside)
+│   │   ├── orders.go                       # Order reservation, confirmation, cancellation & lookup
+│   │   ├── products.go                     # Product catalog CRUD
+│   │   ├── warehouses.go                   # Warehouse facilities CRUD
+│   │   ├── response.go                     # JSON serialization & 1MB body limit enforcement
 │   │   └── middleware/
-│   │       ├── idempotency.go               # SHA-256 keyed idempotency with response replay
-│   │       ├── semaphore.go                 # Channel-based concurrency limiter + load shedding
-│   │       └── semaphore_test.go            # Unit tests: pass-through, queue-wait, timeout, ctx cancel
+│   │       ├── idempotency.go              # SHA-256 idempotency check with response replay
+│   │       ├── semaphore.go                # Admission control & load shedding (100 concurrent slots)
+│   │       └── semaphore_test.go           # Semaphore unit & timeout tests
 │   ├── config/
-│   │   └── config.go                        # Env-based configuration (PORT, DATABASE_URL, REDIS, KAFKA)
+│   │   └── config.go                       # Environment variable loader
+│   ├── metrics/
+│   │   └── metrics.go                      # Prometheus histograms, counters, and gauges
 │   ├── repository/
-│   │   ├── queries/                         # Raw SQL (sqlc input)
-│   │   │   ├── inventory.sql                # Upsert restock, reserve (3 strategies), confirm, rollback
-│   │   │   ├── orders.sql                   # Order CRUD, warehouse routing query, expired order scan
-│   │   │   ├── outbox.sql                   # Insert, fetch SKIP LOCKED, mark published, reclaim stale
-│   │   │   ├── idempotency.sql              # Get/Create/Complete idempotency keys
-│   │   │   ├── products.sql                 # Product CRUD
-│   │   │   └── warehouses.sql               # Warehouse CRUD
-│   │   └── db/                              # sqlc-generated Go code (type-safe queries)
+│   │   ├── db/                             # sqlc-generated type-safe queries & models
+│   │   └── queries/                        # Handwritten raw SQL queries
+│   │       ├── inventory.sql
+│   │       ├── orders.sql
+│   │       ├── outbox.sql
+│   │       ├── idempotency.sql
+│   │       ├── products.sql
+│   │       └── warehouses.sql
 │   ├── service/
-│   │   ├── reservation_service.go           # Order lifecycle: Reserve (routing + strategy + audit), Confirm, Cancel
-│   │   └── routing_service.go               # Haversine-based warehouse ranking with cost function
+│   │   ├── reservation_service.go          # Transactional order lifecycle & strategy execution
+│   │   └── routing_service.go              # Geo-proximity & stock ratio multi-warehouse allocation
 │   ├── strategy/
-│   │   ├── strategy.go                      # ReservationStrategy interface
-│   │   ├── pessimistic.go                   # SELECT FOR UPDATE → check → UPDATE
-│   │   ├── optimistic.go                    # Read → CAS UPDATE WHERE version=? + backoff/jitter
-│   │   ├── atomic.go                        # Single UPDATE WHERE available_qty >= ?
-│   │   └── adaptive.go                      # Runtime strategy selector (Redis contention tracking)
+│   │   ├── strategy.go                     # ReservationStrategy interface definition
+│   │   ├── pessimistic.go                  # Row-lock strategy (SELECT FOR UPDATE)
+│   │   ├── optimistic.go                   # Version CAS strategy with backoff & jitter
+│   │   ├── atomic.go                       # Single-statement conditional update strategy
+│   │   └── adaptive.go                     # Dynamic dispatcher with Redis rate tracking
 │   └── worker/
-│       ├── outbox_relay.go                  # Poll outbox → publish to Kafka → mark published
-│       ├── reaper.go                        # Reclaim expired reservations → restore stock
-│       └── consumer.go                      # Kafka consumer (3PL logistics dispatcher + dedup)
+│       ├── outbox_relay.go                 # Background relay: outbox table -> Kafka topic
+│       ├── reaper.go                       # Background reaper: reclaims expired zombie reservations
+│       └── consumer.go                     # 3PL logistics dispatcher simulation with deduplication
 ├── migrations/
-│   ├── 001_init.sql                         # Core schema: warehouses, products, inventory, orders, audit log
-│   └── 002_outbox.sql                       # Outbox table with partial index on PENDING/PROCESSING
+│   ├── 001_init.sql                        # Schema: warehouses, products, inventory, orders, audit log
+│   └── 002_outbox.sql                      # Schema: outbox table with status partial indexes
 ├── pkg/
 │   └── geo/
-│       ├── haversine.go                     # Great-circle distance calculation
-│       └── haversine_test.go                # Unit tests with tolerance-based assertions
+│       ├── haversine.go                    # Great-circle distance calculations
+│       └── haversine_test.go               # Distance unit tests
 ├── test/
-│   └── integration/
-│       ├── inventory_test.go                # CHECK constraint validation, restock correctness
-│       ├── reservation_test.go              # 1,000-goroutine zero-oversell proof
-│       ├── order_lifecycle_test.go           # Full Reserve→Confirm, Reserve→Cancel, state machine tests
-│       ├── outbox_test.go                   # Outbox relay publish, retry, stale lease reclaim (mock Kafka)
-│       ├── reaper_test.go                   # Reaper reclaim, skip-active, SLA < 5s verification
-│       └── benchmark_test.go               # Strategy comparison + parallel benchmarks (b.RunParallel)
-├── docker-compose.yml                       # PostgreSQL 16 + Redis 7 + Redpanda (Kafka)
-├── sqlc.yml                                 # sqlc configuration (pgx/v5, JSON tags, interface emission)
-└── go.mod                                   # Module definition and dependencies
+│   ├── integration/
+│   │   ├── inventory_test.go               # PostgreSQL CHECK constraint verification
+│   │   ├── reservation_test.go             # 1,000-goroutine zero-oversell proof
+│   │   ├── order_lifecycle_test.go         # Full reserve -> confirm -> cancel lifecycle tests
+│   │   ├── outbox_test.go                  # Outbox relay, retry, and lease reclamation tests
+│   │   ├── reaper_test.go                  # Zombie stock reclamation SLA tests
+│   │   └── benchmark_test.go               # Strategy throughput benchmarks
+│   └── k6/
+│       ├── s1_zero_oversell.js             # 500 VU flash sale spike test (100 units)
+│       ├── s2_zombie_stock.js              # Zombie stock reclamation SLA test
+│       ├── s3_deadlock.js                  # Cross-warehouse reverse locking deadlock test
+│       ├── s4_latency.js                   # 500 RPS sustained throughput latency test
+│       ├── s5_outbox_chaos.js              # Outbox streaming reliability test
+│       └── s6_strategy_benchmark.js        # High vs low contention strategy benchmark
+├── docker-compose.yml                      # Postgres, Redis, Redpanda, Prometheus, Grafana
+├── sqlc.yml                                # sqlc generator configuration
+└── go.mod                                  # Module definition & dependencies
 ```
 
 ---
 
 ## Getting Started
 
-**Prerequisites:** Go 1.27+, Docker Desktop
+### Prerequisites
+- **Go 1.27+**
+- **Docker Desktop**
+- **k6** (optional, for running load tests)
 
+### 1. Clone & Start Infrastructure
 ```bash
 git clone https://github.com/yashyadav-4/ware_go.git
 cd ware_go
 
-# Start infrastructure
+# Start all infrastructure services (Postgres, Redis, Redpanda, Prometheus, Grafana)
 docker compose up -d
+```
 
-# Apply schema
+### 2. Apply Database Migrations
+```bash
 docker exec -i Ware_Go_postgres psql -U postgres -d ware_go < migrations/001_init.sql
 docker exec -i Ware_Go_postgres psql -U postgres -d ware_go < migrations/002_outbox.sql
+```
 
-# Run the server
+### 3. Run the Server
+```bash
 go run cmd/server/main.go
 ```
 
-```bash
-# Health check
-curl http://localhost:8080/healthz
+The server initializes on port `8080`, launches the background Reaper and Outbox Relay daemons, and begins streaming to Kafka.
 
-# Create a warehouse
+### 4. Verify Services
+- **Health Check**: `curl http://localhost:8080/healthz`
+- **Prometheus UI**: `http://localhost:9090`
+- **Grafana Dashboard**: `http://localhost:3000` (Login: `admin` / `admin` $\to$ browse to `Ware_Go — Concurrency & Performance Engine`)
+- **pprof Profiler**: `http://localhost:8080/debug/pprof/`
+
+### 5. Quick Walkthrough
+```bash
+# 1. Create a warehouse
 curl -X POST http://localhost:8080/api/v1/warehouses \
   -H "Content-Type: application/json" \
   -d '{"code":"BLR-1","name":"Bangalore Hub","latitude":12.9716,"longitude":77.5946}'
 
-# Register a product
+# 2. Register a product
 curl -X POST http://localhost:8080/api/v1/products \
   -H "Content-Type: application/json" \
   -d '{"sku":"MACBOOK-M3-16","name":"MacBook Pro M3 16-inch","unit_weight_grams":2140}'
 
-# Restock (ACID tx + audit log)
+# 3. Restock inventory (ACID transaction + audit log + cache invalidation)
 curl -X POST http://localhost:8080/api/v1/inventory/restock \
   -H "Content-Type: application/json" \
-  -d '{"warehouse_id":"<id>","sku":"MACBOOK-M3-16","quantity":50}'
+  -d '{"warehouse_id":"<INSERT_WAREHOUSE_UUID>","sku":"MACBOOK-M3-16","quantity":50}'
 
-# Read stock — observe X-Cache: MISS then X-Cache: HIT
+# 4. Read stock (First request: X-Cache: MISS, Second request: X-Cache: HIT)
 curl -i http://localhost:8080/api/v1/inventory/MACBOOK-M3-16
 curl -i http://localhost:8080/api/v1/inventory/MACBOOK-M3-16
 
-# Reserve an order (idempotent)
+# 5. Reserve an order (Idempotent, Geo-routed, Adaptive Lock)
 curl -X POST http://localhost:8080/api/v1/orders/reserve \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: order-001" \
-  -d '{"dest_latitude":28.6139,"dest_longitude":77.2090,"items":[{"sku":"MACBOOK-M3-16","quantity":2}]}'
+  -H "Idempotency-Key: flash-order-001" \
+  -d '{
+    "dest_latitude": 28.6139,
+    "dest_longitude": 77.2090,
+    "items": [{"sku": "MACBOOK-M3-16", "quantity": 2}],
+    "ttl_seconds": 600
+  }'
 
-# Confirm the order
-curl -X POST http://localhost:8080/api/v1/orders/<order_id>/confirm
+# 6. Confirm the order (Commits stock and writes to Outbox -> published to Kafka)
+curl -X POST http://localhost:8080/api/v1/orders/<INSERT_ORDER_UUID>/confirm
 ```
 
 ---
 
 ## Running Tests
 
+### Unit & Integration Suite
 ```bash
-# Unit tests (no infrastructure required)
-go test -v ./pkg/geo/...
-go test -v ./internal/api/middleware/...
+# Run all unit tests
+go test -v ./pkg/geo/... ./internal/api/middleware/...
 
-# Integration tests (Docker containers must be running)
+# Run all integration tests against Docker
 go test -v ./test/integration/...
 
-# Race detector — run before every commit
+# Run with race detector
 go test -race ./...
 
-# Benchmarks
+# Run benchmarks
 go test -bench=. -benchmem ./test/integration/...
+```
+
+### k6 Concurrency & Chaos Suite
+Make sure the server and Docker containers are running:
+
+```bash
+# S1: Flash Sale Spike (500 VUs racing for 100 items -> verifies zero oversell)
+k6 run test/k6/s1_zero_oversell.js
+
+# S2: Zombie Stock Reclamation SLA (< 5s target)
+k6 run test/k6/s2_zombie_stock.js
+
+# S3: Cross-Warehouse Deadlock Immunity (200 VUs, reverse lock ordering)
+k6 run test/k6/s3_deadlock.js
+
+# S4: Sustained Throughput Latency (500 RPS)
+k6 run test/k6/s4_latency.js
+
+# S5: Transactional Outbox Pipeline & Chaos
+k6 run test/k6/s5_outbox_chaos.js
+
+# S6: Adaptive Strategy Benchmark (Hot vs Cold SKUs)
+k6 run test/k6/s6_strategy_benchmark.js
 ```
 
 ---
@@ -550,11 +661,12 @@ go test -bench=. -benchmem ./test/integration/...
 
 | Variable | Default | Description |
 |---|---|---|
-| `PORT` | `8080` | HTTP server port |
+| `PORT` | `8080` | HTTP server listening port |
 | `DATABASE_URL` | `postgres://postgres:postgrespassword@localhost:5432/ware_go?sslmode=disable` | PostgreSQL connection string |
-| `REDIS_ADDR` | `localhost:6379` | Redis address |
-| `KAFKA_BROKERS` | `localhost:19092` | Kafka/Redpanda broker address |
+| `REDIS_ADDR` | `localhost:6379` | Redis server address |
+| `KAFKA_BROKERS` | `localhost:19092` | Kafka / Redpanda broker address |
+| `GEMINI_API_KEY` | *(Optional)* | Gemini API Key for autonomous inventory intelligence |
 
 ---
 
-*Built by [Yash Yadav](https://github.com/yashyadav-4) · Go · PostgreSQL · Redis · Kafka · 2026*
+*Built by [Yash Yadav](https://github.com/yashyadav-4) · Go · PostgreSQL · Redis · Kafka · Prometheus · Grafana · 2026*
