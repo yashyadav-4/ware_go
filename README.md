@@ -144,7 +144,7 @@ Ware_Go implements the **Strategy Pattern**, exposing three distinct engines beh
 #### Dynamic Contention Escalation
 The `AdaptiveStrategy` dispatcher automatically selects the optimal strategy at runtime:
 1. **Single-Item Fast Path**: Single-item orders bypass reads and execute via the lock-free Atomic conditional strategy.
-2. **Velocity-Based Escalation**: The system tracks request velocity per SKU in Redis using sliding-window counters (`INCR` + `EXPIRE 1s`). When request frequency exceeds **10 requests/second**, multi-item transactions are automatically escalated to **Pessimistic locking**, completely preventing CAS retry storms.
+2. **Velocity-Based Escalation**: The system tracks request velocity individually per SKU in Redis using sliding-window counters (`INCR contention:<sku>` + `EXPIRE 1s`). When request frequency for a specific product exceeds **10 requests/second per SKU** (rather than a global platform threshold), multi-item transactions for that product are automatically escalated to **Pessimistic locking** (`SELECT ... FOR UPDATE`), while low-contention items continue using lock-free Optimistic CAS.
 3. **Explicit Override**: Specific locking strategies can be pinned for benchmarking or testing via context: `context.WithValue(ctx, StrategyOverrideKey, "pessimistic")`.
 
 ---
@@ -190,7 +190,7 @@ Ware_Go resolves this using the **Transactional Outbox Pattern**:
 
 When an order arrives, fulfillment centers are evaluated using a **multi-variable weighted cost function** that balances customer transit proximity against inventory preservation:
 
-$$\text{Cost} = 0.7 \times \left(\frac{D}{\text{Max\_Distance}}\right) + 0.3 \times \left(1.0 - \frac{S_{\text{warehouse}}}{S_{\text{network}}}\right)$$
+$$\text{Cost} = 0.7 \times \left(\frac{D}{D_{\max}}\right) + 0.3 \times \left(1.0 - \frac{S_{\text{warehouse}}}{S_{\text{network}}}\right)$$
 
 - **Distance ($D$)**: Calculated using spherical trigonometry via the **Haversine formula** on Earth's mean radius ($R = 6,371\text{ km}$):
   $$a = \sin^2\left(\frac{\Delta \phi}{2}\right) + \cos(\phi_1)\cos(\phi_2)\sin^2\left(\frac{\Delta \lambda}{2}\right), \quad d = 2R \cdot \text{atan2}(\sqrt{a}, \sqrt{1-a})$$
