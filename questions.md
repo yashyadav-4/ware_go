@@ -58,6 +58,32 @@ A comprehensive reference of all technical, architectural, concurrency, and Go-i
 43. [What does `slog.Default().With("component", "reaper")` mean, and why use structured logging tags in production?](#43-what-does-slogdefaultwithcomponent-reaper-mean-and-why-use-structured-logging-tags-in-production)
 44. [What are the core components of a Kafka message (`Topic`, `Key`, `Value`, `Headers`, `Timestamp`), and what role does each play in Ware_Go?](#44-what-are-the-core-components-of-a-kafka-message-topic-key-value-headers-timestamp-and-what-role-does-each-play-in-ware_go)
 
+### Part 5: Load Testing, Observability & Performance Profiling (Week 6)
+45. [Why use k6 instead of Postman or JMeter for concurrency and load testing?](#45-why-use-k6-instead-of-postman-or-jmeter-for-concurrency-and-load-testing)
+46. [Why did our k6 script fail initially with a database error on warehouse code `VARCHAR(20)`?](#46-why-did-our-k6-script-fail-initially-with-a-database-error-on-warehouse-code-varchar20)
+47. [Why did `s1_zero_oversell.js` require unique Idempotency Keys across VUs?](#47-why-did-s1_zero_overselljs-require-unique-idempotency-keys-across-vus)
+48. [How does the Reaper SLA test (`s2_zombie_stock.js`) work with fast TTLs?](#48-how-does-the-reaper-sla-test-s2_zombie_stockjs-work-with-fast-ttls)
+49. [How does Scenario 3 (`s3_deadlock.js`) prove deadlock freedom under opposing cross-warehouse orders?](#49-how-does-scenario-3-s3_deadlockjs-prove-deadlock-freedom-under-opposing-cross-warehouse-orders)
+50. [How does Scenario 4 (`s4_latency.js`) measure latency curves under sustained load?](#50-how-does-scenario-4-s4_latencyjs-measure-latency-curves-under-sustained-load)
+51. [How does the Semaphore Load Shedder prevent Cascading Failures during traffic surges?](#51-how-does-the-semaphore-load-shedder-prevent-cascading-failures-during-traffic-surges)
+52. [Prometheus & Grafana Architecture: How does metric collection work in Ware_Go without slowing down requests?](#52-prometheus--grafana-architecture-how-does-metric-collection-work-in-ware_go-without-slowing-down-requests)
+53. [How does Go `pprof` profiling work, and how do we capture CPU, heap, and goroutine profiles?](#53-how-does-go-pprof-profiling-work-and-how-do-we-capture-cpu-heap-and-goroutine-profiles)
+
+### Part 6: AI Inventory Rebalancer, Quota Optimization & Production Architecture (Week 7)
+54. [What is the AI Inventory Rebalancing Agent, and why not use pure rule-based logic?](#54-what-is-the-ai-inventory-rebalancing-agent-and-why-not-use-pure-rule-based-logic)
+55. [Model Lifecycle & Free Tier Quota Economics: Why did we switch from Gemini 1.5/2.0 to 3.8 and finally to 3.5 Flash Lite?](#55-model-lifecycle--free-tier-quota-economics-why-did-we-switch-from-gemini-1520-to-38-and-finally-to-35-flash-lite)
+56. [Dynamic LLM Configuration: Why make the model name configurable in `.env`?](#56-dynamic-llm-configuration-why-make-the-model-name-configurable-in-env)
+57. [Why did `/api/v1/agent/proposals` fail initially with `curl (52) Empty reply from server`?](#57-why-did-apiv1agentproposals-fail-initially-with-curl-52-empty-reply-from-server)
+58. [Stateful Proposal Execution & Two-Phase Safety: Why store AI proposals in PostgreSQL before execution?](#58-stateful-proposal-execution--two-phase-safety-why-store-ai-proposals-in-postgresql-before-execution)
+59. [Multi-Stage Dockerfile: Why do we use a multi-stage build, and how does it shrink image size from 1+ GB to 18.1 MB?](#59-multi-stage-dockerfile-why-do-we-use-a-multi-stage-build-and-how-does-it-shrink-image-size-from-1-gb-to-181-mb)
+60. [Unprivileged User Security in Docker: Why create `appuser` and `appgroup`?](#60-unprivileged-user-security-in-docker-why-create-appuser-and-appgroup)
+61. [Why did `RUN go mod download` time out in Docker, and why is `go mod vendor` the production solution?](#61-why-did-run-go-mod-download-time-out-in-docker-and-why-is-go-mod-vendor-the-production-solution)
+62. [Docker Images: What is the difference between `DISK USAGE` and `CONTENT SIZE`?](#62-docker-images-what-is-the-difference-between-disk-usage-and-content-size)
+63. [Horizontal Scaling vs Database Bottleneck: Does adding more containers help when 10,000 requests hit PostgreSQL?](#63-horizontal-scaling-vs-database-bottleneck-does-adding-more-containers-help-when-10000-requests-hit-postgresql)
+64. [Single-VM Architecture: Can we run Nginx, App, Postgres, Redis, and Kafka all on one virtual machine? How does traffic distribution work?](#64-single-vm-architecture-can-we-run-nginx-app-postgres-redis-and-kafka-all-on-one-virtual-machine-how-does-traffic-distribution-work)
+65. [Managed Cloud Services vs Self-Hosted in `docker-compose.yml`: How do external Database URLs work?](#65-managed-cloud-services-vs-self-hosted-in-docker-composeyml-how-do-external-database-urls-work)
+66. [Docker Networks: What does `networks: ware_go_net` and `driver: bridge` mean?](#66-docker-networks-what-does-networks-ware_go_net-and-driver-bridge-mean)
+
 ---
 
 # Part 1: High-Level Architecture & Systems Design
@@ -638,3 +664,461 @@ A Kafka record consists of 5 fundamental parts:
    - `event_type`: e.g. `"OrderFulfilled"`, `"OrderCancelled"`. Downstream microservices inspect this header to route to specific handlers without parsing the entire JSON payload.
    - `aggregate_type`: e.g. `"ORDER"`. Identifies the domain aggregate root.
 5. **`Time`** (`time.Time`): The creation timestamp, recording exactly when the event was emitted by the Outbox Relay. Downstream consumers use this to measure event propagation lag.
+
+---
+
+# Part 5: Load Testing, Observability & Performance Profiling (Week 6)
+
+### 45. Why use k6 instead of Postman or JMeter for concurrency and load testing?
+
+1. **Postman**: Postman is primarily designed for functional API verification and linear collection runs. It uses Node.js's single-threaded event loop and cannot easily simulate hundreds of real, simultaneous OS threads or goroutines firing requests at the exact same microsecond. It is not built for stress testing high-concurrency race conditions.
+2. **Apache JMeter**: While capable of high load, JMeter follows an OS thread-per-virtual-user model written in Java. Simulating 1,000+ VUs consumes gigabytes of JVM memory, incurs heavy garbage collection pauses, and requires complex XML configuration files.
+3. **Grafana k6 (Our Choice)**:
+   - Written in **Go**, compiling directly to a native machine executable with near-zero runtime overhead.
+   - Each Virtual User (VU) runs inside a lightweight Go goroutine rather than an OS thread, allowing thousands of concurrent users to run smoothly on a standard laptop.
+   - Test scenarios are scripted in modern JavaScript/ES6.
+   - Built-in **Thresholds** allow automated mathematical assertions directly in terminal / CI/CD (e.g. `p(99) < 250ms`, `rate == 0`).
+
+---
+
+### 46. Why did our k6 script fail initially with a database error on warehouse code `VARCHAR(20)`?
+
+In `s1_zero_oversell.js`, the setup function seeded temporary warehouses and generated warehouse codes dynamically:
+```javascript
+const whCode = `WH-FLASH-${Date.now()}`;
+```
+`Date.now()` produces a 13-digit Unix millisecond timestamp (e.g., `1794451234567`).  
+Concatenated with `WH-FLASH-`, the string length was:
+`9 + 13 = 22 characters`.
+
+However, our PostgreSQL database schema in `001_init.sql` strictly enforces:
+```sql
+code VARCHAR(20) NOT NULL UNIQUE
+```
+PostgreSQL rejected the insert with SQLSTATE `22001` (`string_data_right_truncation`).
+
+**The Fix**:  
+Replaced timestamp concatenation with a bounded random 5-digit integer:
+```javascript
+const rand = Math.floor(10000 + Math.random() * 90000);
+const whCode = `WH-${rand}`; // e.g. "WH-48291" (8 chars <= 20)
+```
+This taught an essential production lesson: test harnesses must strictly honor database column constraint boundaries.
+
+---
+
+### 47. Why did `s1_zero_oversell.js` require unique Idempotency Keys across VUs?
+
+In Ware_Go, we built an Idempotency Middleware in Week 3 that caches every successful response in Redis by `Idempotency-Key`.
+
+If our load test script had sent the same hardcoded `Idempotency-Key: test-flash-sale` across all 500 Virtual Users:
+1. VU #1 would hit PostgreSQL, acquire row locks, and reserve 1 unit of stock.
+2. VUs #2 through #500 would hit Redis, find the cached HTTP 200 response, and immediately return `{"status":"RESERVED"}` with `X-Idempotent-Replay: true`.
+3. **The bug**: 500 requests would report HTTP 200 success, but only 1 unit was ever deducted in PostgreSQL! 99 units would remain in the warehouse while the test falsely reported 500 orders reserved.
+
+**The Solution**:  
+Each concurrent VU generates a unique UUID v4 as its `Idempotency-Key`:
+```javascript
+"Idempotency-Key": `order-s1-${__VU}-${__ITER}-${Date.now()}`
+```
+This forces all 500 VUs to bypass the replay cache and aggressively compete for database row locks simultaneously, creating the exact race condition needed to prove Claim 1 (Zero Oversell).
+
+---
+
+### 48. How does the Reaper SLA test (`s2_zombie_stock.js`) work with fast TTLs?
+
+In standard operations, unpaid order reservations expire after 10 or 15 minutes. However, waiting 15 minutes in an automated load test is completely impractical.
+
+**The Fast-TTL Test Mechanism**:
+1. `s2_zombie_stock.js` seeds a warehouse with 100 units of stock.
+2. It reserves 50 units while passing an explicit short expiration override (`expires_in_seconds: 2`).
+3. Database `available_qty` drops from 100 to 50, and `reserved_qty` rises to 50.
+4. The test records the exact millisecond expiration threshold: $T_{\text{expire}} = T_{\text{reserve}} + 2000\text{ms}$.
+5. The test polls the stock endpoint every 200ms until `available_qty` returns to 100.
+6. The measured duration $T_{\text{recovery}} - T_{\text{expire}}$ was **2,731 ms**.
+7. Because $2.731\text{s} \le 5.0\text{s}$, it empirically proved Claim 4: abandoned zombie inventory is reclaimed within the 5.0-second SLA.
+
+---
+
+### 49. How does Scenario 3 (`s3_deadlock.js`) prove deadlock freedom under opposing cross-warehouse orders?
+
+A classic database deadlock occurs when two transactions attempt to lock the same resources in opposing order:
+- **Transaction A**: Locks Warehouse 1, then attempts to lock Warehouse 2.
+- **Transaction B**: Locks Warehouse 2, then attempts to lock Warehouse 1.
+- Both transactions freeze indefinitely waiting for each other. PostgreSQL's deadlock detector eventually detects the cycle and aborts one transaction with error:  
+  `ERROR: deadlock detected (SQLSTATE 40P01)`.
+
+**The Proof in `s3_deadlock.js`**:
+1. We spun up 200 concurrent VUs dividing into two adversarial groups:
+   - Group Even: requested items in order `[Warehouse-A, Warehouse-B]`.
+   - Group Odd: requested items in reverse order `[Warehouse-B, Warehouse-A]`.
+2. Because Ware_Go enforces the **Global Lock Hierarchy** in Go before opening the database transaction:
+   ```go
+   sort.Slice(warehouses, func(i, j int) bool {
+       return warehouses[i].ID < warehouses[j].ID
+   })
+   ```
+3. Even though Group Odd sent the request in reverse order, Go sorted the IDs deterministically before issuing SQL `SELECT ... FOR UPDATE`.
+4. Result: 200 VUs competed simultaneously across opposing carts with **0 deadlocks** (`deadlock_detected = 0`), proving Claim 3.
+
+---
+
+### 50. How does Scenario 4 (`s4_latency.js`) measure latency curves under sustained load?
+
+Instead of generating arbitrary bursts, `s4_latency.js` uses k6's `constant-arrival-rate` executor:
+```javascript
+executor: 'constant-arrival-rate',
+rate: 500,
+timeUnit: '1s',
+duration: '20s',
+preAllocatedVUs: 100,
+maxVUs: 200,
+```
+- It drives a strict, constant 500 requests per second into the system for 20 seconds (10,000 total requests).
+- It measures p50 (median), p95 (95th percentile), and p99 (99th percentile) latency.
+- It proves Claim 2: cache hits return in $< 1\text{ms}$ from Redis, while full ACID reservation transactions via PostgreSQL commit with a p95 under 100ms and p99 under 250ms, without latency degradation under sustained load.
+
+---
+
+### 51. How does the Semaphore Load Shedder prevent Cascading Failures during traffic surges?
+
+When incoming traffic surges past system capacity (e.g. 10,000 requests per second hit a server sized for 2,000 RPS):
+1. **Without Load Shedding**: All 10,000 requests open database connections, fill goroutine stacks, and saturate CPU memory. The database connection pool is exhausted, response times blow past 15 seconds, client timeouts trigger retries, and the entire system collapses into an unresponsive crash (Cascading Failure / Death Spiral).
+2. **With Ware_Go's Bounded Wait Semaphore**:
+   - We allocate a buffered channel of 100 tokens: `make(chan struct{}, 100)`.
+   - Only 100 concurrent requests may execute database transactions at any millisecond.
+   - Request #101 does not crash; it waits in a bounded window (`waitTimeout = 150ms`).
+   - If an active slot frees up within 150ms, request #101 grabs the slot and executes.
+   - If 150ms passes and all 100 slots remain saturated, the request is immediately rejected with:  
+     `HTTP 503 Service Unavailable: server overloaded, please retry`.
+3. **The Result**: PostgreSQL never receives more than 100 concurrent transactions. Throughput remains near peak capacity, latencies stay bounded, and the server recovers instantaneously as soon as traffic subsides.
+
+---
+
+### 52. Prometheus & Grafana Architecture: How does metric collection work in Ware_Go without slowing down requests?
+
+In high-concurrency systems, logging or recording metrics to disk or database inside HTTP handlers adds latency and disk I/O contention.
+
+**How Ware_Go Solves This**:
+1. **In-Memory Lock-Free Collection**:
+   The `promhttp` library maintains metric counters and histogram buckets as in-memory atomic 64-bit floating point numbers. Recording an HTTP request duration takes less than 20 nanoseconds (CPU cache operation) with zero locks.
+2. **Pull-Based Architecture**:
+   Prometheus scrapes the `/metrics` endpoint on an independent background timer (e.g. every 5 seconds). HTTP handlers never push data over the network.
+3. **Grafana Dashboards**:
+   Grafana connects to Prometheus as a data source and executes PromQL queries (e.g. `rate(http_requests_total[1m])`, `histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[1m])) by (le))`) to visualize real-time RPS, error rates, p95/p99 latency curves, and worker queue depths.
+
+---
+
+### 53. How does Go `pprof` profiling work, and how do we capture CPU, heap, and goroutine profiles?
+
+Go includes an industrial-grade runtime profiler built directly into the standard library (`net/http/pprof`).
+
+1. **Mounting Endpoints**:
+   In `internal/api/router.go`, we mount `/debug/pprof/` routes:
+   - `/debug/pprof/profile`: CPU execution profiling.
+   - `/debug/pprof/heap`: Memory allocation and live heap objects.
+   - `/debug/pprof/goroutine`: Stack traces of all running goroutines (detects goroutine leaks).
+2. **Capturing a 30-Second CPU Profile**:
+   ```bash
+   go tool pprof http://localhost:8080/debug/pprof/profile?seconds=30
+   ```
+   During this window, Go interrupts the CPU at 100Hz to sample instruction pointers across all OS threads.
+3. **Analyzing in the Web UI / Flame Graph**:
+   ```bash
+   go tool pprof -http=:8081 cpu.pprof
+   ```
+   This generates an interactive Flame Graph showing exactly which functions (e.g. JSON serialization, pgx connection acquisition, SQL query execution) consume the most CPU cycles.
+
+---
+
+# Part 6: AI Inventory Rebalancer, Quota Optimization & Production Architecture (Week 7)
+
+### 54. What is the AI Inventory Rebalancing Agent, and why not use pure rule-based logic?
+
+1. **The Problem**: Over time, regional fulfillment centers become unbalanced. Warehouse A may have 500 units of a laptop with 2 orders per week, while Warehouse B has only 5 units with 50 orders per week and faces impending stockouts.
+2. **Why Not Pure Rule-Based Logic?**:
+   - Hardcoded if-else heuristics (e.g., `if stock < 10 then transfer from highest`) fail to consider complex multi-variable business context: transportation distances, carrying costs, SKU turnover velocity, regional seasonal spikes, and warehouse storage capacity constraints.
+3. **The Ware_Go Hybrid Solution**:
+   - Our system fetches live warehouse stock levels and coordinates via PostgreSQL.
+   - It submits the structured snapshot to **Google Gemini 3.5 Flash Lite** with a strict JSON schema prompt.
+   - Gemini evaluates the network topology, computes optimal stock transfer deltas, and produces:
+     1. Structured transfer steps (`source_warehouse_id`, `target_warehouse_id`, `sku`, `quantity`).
+     2. A human-readable business justification (`analysis`) explaining the economic and operational rationale.
+
+---
+
+### 55. Model Lifecycle & Free Tier Quota Economics: Why did we switch from Gemini 1.5/2.0 to 3.8 and finally to 3.5 Flash Lite?
+
+During Week 7 development, we encountered critical real-world LLM lifecycle dynamics:
+
+1. **`gemini-1.5-flash` / `gemini-2.0`**:
+   Google retired / deprecated these endpoints, returning:  
+   `Error 404: models/gemini-2.5-flash is no longer available`.
+2. **`gemini-3.8-flash`**:
+   Upgrading to `gemini-3.8-flash` succeeded initially, but quickly hit:  
+   `Error 429: Resource has been exhausted (check quota and billing)`.  
+   **The Discovery**: Gemini 3.8 Flash Free Tier has extremely tight limits: **5 Requests Per Minute (RPM)** and **20 Requests Per Day (RPD)**. A single retry or test burst immediately exhausts the entire daily quota.
+3. **`gemini-3.5-flash-lite` (The Production Winner)**:
+   Google offers generous developer tier allocations for `gemini-3.5-flash-lite`:
+   - **15 Requests Per Minute** (3x higher throughput).
+   - **500 Requests Per Day** (25x higher daily quota).
+   - Ultra-fast token latency ($< 1.5\text{s}$ response time).
+   Switching to `gemini-3.5-flash-lite` gave us high availability, deterministic schema generation, and zero rate limit errors.
+
+---
+
+### 56. Dynamic LLM Configuration: Why make the model name configurable in `.env`?
+
+Hardcoding model identifiers like `const ModelName = "gemini-3.5-flash-lite"` inside Go source code is a major anti-pattern:
+- LLM providers update, alias, and deprecate model IDs on rapid release cycles.
+- If a model is deprecated, a hardcoded application crashes in production with HTTP 404 until engineers commit code, build binaries, and redeploy containers.
+
+**Our Implementation in `internal/config/config.go`**:
+```go
+GeminiModel: getEnv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+```
+By making `GEMINI_MODEL` configurable via `.env` with a reliable fallback, DevOps can switch models instantly in production without recompiling or redeploying code.
+
+---
+
+### 57. Why did `/api/v1/agent/proposals` fail initially with `curl (52) Empty reply from server`?
+
+When testing `POST /api/v1/agent/proposals`, the curl client froze for 10 seconds and aborted with:
+`curl: (52) Empty reply from server`.
+
+**The Root Cause**:
+In `cmd/server/main.go`, our HTTP server had an aggressive write timeout:
+```go
+server := &http.Server{
+    Addr:         ":" + cfg.Port,
+    Handler:      router,
+    ReadTimeout:  10 * time.Second,
+    WriteTimeout: 10 * time.Second, // <-- The Culprit!
+}
+```
+External LLM calls over the public internet (connecting to `generativelanguage.googleapis.com`, generating tokens, returning JSON) typically take **12 to 18 seconds** on cold start or network jitter.  
+At second 10, Go's HTTP server fired the `WriteTimeout` deadline and **forcefully closed the underlying TCP connection**, dropping the client before the handler could write the HTTP response.
+
+**The Fix**:  
+Increased `WriteTimeout` and `ReadTimeout` to `60 * time.Second` on `http.Server`. The client received the full HTTP 200 JSON payload cleanly.
+
+---
+
+### 58. Stateful Proposal Execution & Two-Phase Safety: Why store AI proposals in PostgreSQL before execution?
+
+Allowing an AI model to execute physical inventory transfers directly in a single step is unsafe and violates enterprise audit compliance.
+
+**Our Two-Phase Stateful Architecture**:
+1. **Phase 1: Generation & Persistence (`POST /api/v1/agent/proposals`)**:
+   - LLM generates transfer proposals.
+   - We write the proposal into PostgreSQL table `rebalance_proposals` with:
+     - `status = 'PENDING'`
+     - `analysis = TEXT`
+     - `proposals_json = JSONB`
+     - `created_at = NOW()`
+   - An operations manager or inventory lead can review the proposal.
+2. **Phase 2: Atomic Execution (`POST /api/v1/agent/execute-transfer`)**:
+   - Reads the latest proposal from PostgreSQL.
+   - Validates that `status == 'PENDING'`.
+   - Executes stock deduction from the source warehouse and addition to the target warehouse inside a **single ACID transaction**.
+   - Emits immutable accounting entries (`TRANSFER_OUT`, `TRANSFER_IN`) in `inventory_audit_log`.
+   - Updates `status = 'EXECUTED'` and `executed_at = NOW()`.
+3. **Duplicate Prevention**:
+   - If an engineer or cron job triggers `POST /api/v1/agent/execute-transfer` a second time, the database checks status and immediately rejects the call with:  
+     `HTTP 409 Conflict: the latest rebalance proposal has already been executed`.
+   - This mathematically prevents double-transfers or duplicate inventory deductions.
+
+---
+
+### 59. Multi-Stage Dockerfile: Why do we use a multi-stage build, and how does it shrink image size from 1+ GB to 18.1 MB?
+
+A standard single-stage Dockerfile builds and runs in the same image:
+```dockerfile
+FROM golang:1.24
+COPY . .
+RUN go build -o /app/server cmd/server/main.go
+CMD ["/app/server"]
+```
+This single image bundles the Go compiler, standard library source files, git, C build tools, and layer caches, resulting in an image size of **over 1.2 Gigabytes**.
+
+**Our Production Multi-Stage Strategy (`Dockerfile`)**:
+1. **Stage 1 (Builder)**:
+   - Uses `golang:alpine`.
+   - Compiles the binary using:
+     ```bash
+     CGO_ENABLED=0 GOOS=linux go build -mod=vendor -ldflags="-s -w" -o /app/warego-server ./cmd/server
+     ```
+   - `-ldflags="-s -w"` strips all debugging information and DWARF symbol tables, shaving 40% off the executable binary size.
+   - `CGO_ENABLED=0` produces a 100% statically linked binary with zero dependencies on external C runtime libraries (`glibc`).
+2. **Stage 2 (Minimal Runner)**:
+   - Uses `alpine:latest` (~7 MB base).
+   - Adds only root CA certificates (`ca-certificates`) and `curl` for container healthchecks.
+   - Copies **ONLY the single compiled binary** (`/app/warego-server`) from the builder stage.
+   - Completely discards Go source code, compilers, build caches, and tools.
+3. **The Result**:
+   - Final Docker Content Size: **18.1 Megabytes**!
+   - 98.5% smaller than standard images, blazingly fast to pull across Kubernetes clusters, and minimal attack surface.
+
+---
+
+### 60. Unprivileged User Security in Docker: Why create `appuser` and `appgroup`?
+
+By default, Docker containers run all processes as the `root` superuser (UID 0).
+
+**The Security Risk**:
+If an attacker discovers a remote code execution (RCE) vulnerability in an HTTP endpoint or third-party dependency:
+1. They execute commands inside the container as `root`.
+2. Any volume mounted from the host (such as Docker sockets or file shares) can be rewritten with superuser authority.
+3. If a container breakout vulnerability exists in the Linux kernel, the attacker gains direct root access to the physical host node.
+
+**Our Defense**:
+In Stage 2 of `Dockerfile`:
+```dockerfile
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+USER appuser
+```
+The application runs as unprivileged user `appuser` (UID 10001). Even if the application process were compromised, it cannot modify system packages, mount devices, or escape container boundaries.
+
+---
+
+### 61. Why did `RUN go mod download` time out in Docker, and why is `go mod vendor` the production solution?
+
+During Docker image build on Windows, line 9 of the Dockerfile failed after 575 seconds:
+```
+=> ERROR [builder 5/7] RUN go mod download:
+stream error: stream ID 231; INTERNAL_ERROR; received from peer
+read "https://proxy.golang.org/...": unexpected EOF
+```
+
+**Why This Happened**:
+1. `RUN go mod download` makes dozens of external HTTPS requests to `proxy.golang.org` to download tarballs of all project dependencies.
+2. In constrained, firewalled, or intermittent corporate/home network environments, large dependency downloads drop sockets and time out.
+3. Depending on external internet access during a container build makes CI/CD builds non-deterministic, slow, and fragile.
+
+**The Production Fix: Go Vendoring**:
+1. Run `go mod vendor` on the host machine.
+2. This downloads and stores the exact source code of every dependency into a local `vendor/` directory.
+3. In `Dockerfile`, replace `RUN go mod download` with:
+   ```dockerfile
+   RUN CGO_ENABLED=0 GOOS=linux go build -mod=vendor -ldflags="-s -w" -o /app/warego-server ./cmd/server
+   ```
+4. **Benefits**:
+   - Build time plummeted from 575s (failure) to **30.1 seconds** (success).
+   - Builds are **100% offline**, reproducible, and immune to proxy timeouts or third-party package outages.
+
+---
+
+### 62. Docker Images: What is the difference between `DISK USAGE` and `CONTENT SIZE`?
+
+When inspecting our image using `docker images ware_go:latest`:
+```
+IMAGE            ID             DISK USAGE   CONTENT SIZE
+ware_go:latest   0a3dc62ff9d9       67.7MB         18.1MB
+```
+
+1. **`CONTENT SIZE` (18.1 MB)**:
+   - The actual uncompressed size of the root filesystem layers contained in the image (the Alpine OS files + our compiled Go binary).
+   - This is the true metric of image efficiency. When pushing to Docker Hub or AWS ECR, only these compressed layers (~9 MB over the wire) are transferred.
+2. **`DISK USAGE` (67.7 MB)**:
+   - The physical disk space currently consumed on your local machine by Docker's storage driver (`overlay2`).
+   - Includes local filesystem metadata, snapshot diff trees, inode allocations, and build cache references linked to that image on the Docker daemon.
+
+---
+
+### 63. Horizontal Scaling vs Database Bottleneck: Does adding more containers help when 10,000 requests hit PostgreSQL?
+
+**The User's Scenario**:
+*"If 10,000 requests hit our service, would running 5 containers instead of 1 help? Since PostgreSQL does row locking (`FOR UPDATE`), won't PostgreSQL always be the bottleneck?"*
+
+**The Deep Answer**:
+1. **For Hot SKUs (Flash Sales)**:
+   - **No, adding more containers does NOT increase throughput for a single hot item!**
+   - If 10,000 requests are competing to reserve the same SKU (e.g. `IPHONE-16`), PostgreSQL must serialize them using row-level locks (`SELECT ... FOR UPDATE`).
+   - Whether those 10,000 requests arrive through 1 container or 10 containers, they all queue up behind the exact same database row lock in PostgreSQL.
+   - In fact, adding 5 containers can **degrade performance**: each container opens 20 database connections, totaling 100 concurrent connections. PostgreSQL must now juggle 100 OS worker processes, causing excessive CPU context switching and lock contention!
+2. **When Does Adding Containers Help?**:
+   - **Stateless Workloads**: JWT token verification, JSON serialization, request validation, Haversine geospatial calculations.
+   - **Cache Hits**: Requests served directly from Redis memory (`GET /api/v1/inventory/:sku`). 5 containers can serve 100,000+ cached RPS easily without touching PostgreSQL.
+   - **Cold SKUs**: If 10,000 requests target 500 different products across 20 warehouses, row locks do not conflict. Multiple containers help saturate database I/O across independent rows.
+3. **How Do High-Scale Systems (Amazon, Flipkart) Solve the Flash Sale Database Bottleneck?**:
+   - **In-Memory Atomic Decrement (Redis + Lua Scripting)**: Decrement inventory in Redis RAM at 100,000 RPS. PostgreSQL is only updated asynchronously via message queues.
+   - **PgBouncer**: Sits between app containers and PostgreSQL to pool transactions and eliminate connection churn.
+   - **Sharding & Partitioning**: Splitting inventory tables by Warehouse ID or Product Category across multiple independent database servers.
+
+---
+
+### 64. Single-VM Architecture: Can we run Nginx, App, Postgres, Redis, and Kafka all on one virtual machine? How does traffic distribution work?
+
+**Yes! For staging, portfolios, or small/medium workloads, running all containers on a single Linux cloud VM (e.g. Azure B2PTSV2) is common practice.**
+
+**How It Works Architecturally**:
+```
+                      Internet Traffic (:80 / :443)
+                                  │
+                                  ▼
+                     ┌───────────────────────────┐
+                     │   Nginx (Reverse Proxy)   │
+                     └─────────────┬─────────────┘
+                                   │ (Round-Robin Load Balancing)
+            ┌──────────────────────┴──────────────────────┐
+            ▼                                             ▼
+  ┌───────────────────┐                         ┌───────────────────┐
+  │  ware_go_app_1    │                         │  ware_go_app_2    │
+  └─────────┬─────────┘                         └─────────┬─────────┘
+            │                                             │
+            └──────────────┬──────────────────────────────┘
+                           │ (ware_go_net Docker Bridge)
+       ┌───────────────────┼───────────────────┐
+       ▼                   ▼                   ▼
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  PostgreSQL  │    │  Redis 7     │    │  Redpanda    │
+│  (DB Engine) │    │  (Cache)     │    │  (Kafka Bus) │
+└──────────────┘    └──────────────┘    └──────────────┘
+```
+
+1. **Traffic Ingestion**: Nginx binds to host ports 80/443, handles TLS/SSL certificates, and proxies HTTP requests to `http://ware_go_app_1:8080` and `http://ware_go_app_2:8080` using round-robin.
+2. **Container Communication**: All containers join a single Docker network (`ware_go_net`). The app containers connect to `postgres:5432`, `redis:6379`, and `redpanda:29092` via Docker's internal DNS.
+3. **Resource Constraint Warning**:
+   - While functionally complete, running Kafka/Redpanda, PostgreSQL, Redis, Nginx, and Go on a machine with **only 1 GB or 2 GB of RAM** will easily encounter Linux Out-Of-Memory (`OOMKilled`) termination under load. Redpanda and Postgres both prefer at least 1 GB to 2 GB of dedicated memory.
+
+---
+
+### 65. Managed Cloud Services vs Self-Hosted in `docker-compose.yml`: How do external Database URLs work?
+
+If you decide to use cloud-managed services (e.g. AWS RDS for Postgres, Upstash for Redis, Confluent Cloud for Kafka):
+
+1. **What to Remove from `docker-compose.yml`**:
+   You simply remove the container service definitions for `postgres:`, `redis:`, and `redpanda:`:
+   - Docker no longer pulls or runs those heavy images locally.
+   - You only run the lightweight `app` container.
+2. **How the Application Connects**:
+   The application does not care whether PostgreSQL is running inside Docker or in an AWS data center in Virginia.
+   You simply supply the managed connection URIs in your `.env` file:
+   ```env
+   DATABASE_URL=postgres://master:secret@prod-db.xyz.rds.amazonaws.com:5432/ware_go?sslmode=require
+   REDIS_URL=redis://default:token@east-redis.upstash.io:6379
+   KAFKA_BROKERS=pkc-xyz.us-east-1.aws.confluent.cloud:9092
+   ```
+3. **Network Behavior**:
+   The Go container reaches the internet through the Docker host gateway, establishing secure TLS connections directly to your managed cloud providers.
+
+---
+
+### 66. Docker Networks: What does `networks: ware_go_net` and `driver: bridge` mean?
+
+In `docker-compose.prod.yml`:
+```yaml
+networks:
+  ware_go_net:
+    driver: bridge
+```
+
+1. **Declaring a New Network**:
+   This tells the Docker daemon to instantiate a private, isolated virtual software switch (bridge) on the host system specifically for Ware_Go containers.
+2. **Bridge Driver**:
+   - In Linux networking, a "bridge" is a software device that connects two or more network segments together.
+   - It assigns private IP addresses (e.g. `172.20.0.x`) to each container attached to it.
+3. **Why Not Use the Default Docker Network?**:
+   - In custom user-defined bridge networks, Docker enables **Automatic Service Discovery via DNS**.
+   - A container can connect to PostgreSQL using `host=postgres` rather than tracking changing IP addresses.
+   - External machines on your home Wi-Fi or local network cannot reach the internal database or cache ports unless explicitly published with `ports:`, providing robust network isolation.
